@@ -1,0 +1,30 @@
+[package]
+name = "tosub"
+version = "0.1.0"
+edition = "2024"
+authors = ["Michael Bachmann <mbachmann@bbmsoft.net>"]
+description = "A subsystem lifecycle management library for tokio applications"
+repository = "https://github.com/babymotte/tosub"
+license = "MIT OR Apache-2.0"
+keywords = ["async", "tokio", "subsystem", "task", "management"]
+categories = ["asynchronous", "rust-patterns"]
+
+[dependencies]
+tokio-util = "0.7.18"
+tokio = { version = "1.49.0", features = ["rt", "time", "signal", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.49.0", features = ["full"] }
+miette = { version = "7.6.0", features = ["fancy"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "deny"
+enum_glob_use = "deny"
+# pedantic = "deny"
+# nursery = "deny"
+unwrap_used = "deny"
