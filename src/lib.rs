@@ -36,6 +36,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+type ChildMap = Arc<Mutex<HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>>>;
+
 pub struct RootBuilder {
     name: String,
     catch_signals: bool,
@@ -299,7 +301,7 @@ pub type SubsystemResult<E> = Result<(), SubsystemError<E>>;
 async fn wait_for_children_shutdown(
     children: &HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>,
 ) {
-    for (_, child) in children {
+    for child in children.values() {
         let mut rx = child.1.clone();
         rx.wait_for(|it| *it).await.ok();
     }
@@ -313,7 +315,7 @@ where
     local: CancellationToken,
     global: CancellationToken,
     cancel_clean_shutdown: CancellationToken,
-    children: Arc<Mutex<HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>>>,
+    children: ChildMap,
     crash: CrashHolder<E>,
     join_handle: (watch::Sender<bool>, watch::Receiver<bool>),
 }
@@ -437,7 +439,7 @@ where
         let mut gc = self.children.lock().expect("mutex is poisoned");
         gc.insert(name.clone(), (res_tx.clone(), res_rx.clone()));
 
-        let handle = SubsystemHandle {
+        SubsystemHandle {
             name,
             global,
             local,
@@ -445,14 +447,12 @@ where
             children,
             crash,
             join_handle: (res_tx, res_rx),
-        };
-
-        handle
+        }
     }
 
     async fn child_joined(
         res: Result<Result<(), E>, JoinError>,
-        children: Arc<Mutex<HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>>>,
+        children: ChildMap,
         child_name: &str,
         crash: &mut CrashHolder<E>,
     ) {
