@@ -35,28 +35,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone)]
-pub enum SubsysResult {
-    Pending,
-    Ok,
-    Error(SubsystemError),
-}
-
-#[derive(Debug, Clone)]
-pub enum SubsystemError {
-    Error(String),
-    ChildErrors(HashMap<String, SubsysResult>),
-}
-
-impl SubsysResult {
-    pub fn is_done(&self) -> bool {
-        match self {
-            SubsysResult::Pending => false,
-            _ => true,
-        }
-    }
-}
-
 pub struct RootBuilder {
     name: String,
     catch_signals: bool,
