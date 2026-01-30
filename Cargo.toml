@@ -1,6 +1,6 @@
 [package]
 name = "tosub"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 edition = "2024"
 authors = ["Michael Bachmann <mbachmann@bbmsoft.net>"]
 description = "A subsystem lifecycle management library for tokio applications"
