@@ -28,9 +28,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    select,
-    signal::unix::{Signal, SignalKind, signal},
-    spawn,
+    select, spawn,
     sync::{oneshot, watch},
     task::JoinError,
     time::timeout,
@@ -195,9 +193,32 @@ impl RootBuilder {
         self
     }
 
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
     fn register_signal_handlers(&self, global: &CancellationToken) {
+        use tokio::signal::ctrl_c;
+
+        let global = global.clone();
+        spawn(async move {
+            let mut counter = 0;
+            loop {
+                ctrl_c().await.expect("Ctrl+C handler not supported");
+                counter += 1;
+                if counter > 1 {
+                    break;
+                }
+                info!("Received Ctrl+C, initiating shutdown.");
+                global.cancel();
+            }
+            process::exit(1);
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+    fn register_signal_handlers(&self, global: &CancellationToken) {
+        use tokio::signal::unix::{SignalKind, signal};
+
         if let Ok(signal) = signal(SignalKind::hangup()) {
-            handle_signal(
+            handle_unix_signal(
                 global,
                 signal,
                 "SIGHUP",
@@ -208,7 +229,7 @@ impl RootBuilder {
         }
 
         if let Ok(signal) = signal(SignalKind::interrupt()) {
-            handle_signal(
+            handle_unix_signal(
                 global,
                 signal,
                 "SIGINT",
@@ -219,13 +240,13 @@ impl RootBuilder {
         }
 
         if let Ok(signal) = signal(SignalKind::quit()) {
-            handle_signal(global, signal, "SIGQUIT", SignalKind::quit().as_raw_value());
+            handle_unix_signal(global, signal, "SIGQUIT", SignalKind::quit().as_raw_value());
         } else {
             error!("Failed to register SIGQUIT handler");
         }
 
         if let Ok(signal) = signal(SignalKind::terminate()) {
-            handle_signal(
+            handle_unix_signal(
                 global,
                 signal,
                 "SIGTERM",
@@ -237,9 +258,10 @@ impl RootBuilder {
     }
 }
 
-fn handle_signal(
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
+fn handle_unix_signal(
     global: &CancellationToken,
-    mut signal: Signal,
+    mut signal: tokio::signal::unix::Signal,
     signal_name: &'static str,
     code: i32,
 ) {
