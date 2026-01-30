@@ -44,18 +44,12 @@ pub struct RootBuilder {
     shutdown_timeout: Option<std::time::Duration>,
 }
 
-struct CrashHolder<E>
-where
-    E: Debug + Display,
-{
-    crash: Arc<Mutex<SubsystemResult<E>>>,
+struct CrashHolder {
+    crash: Arc<Mutex<SubsystemResult>>,
     cancel: CancellationToken,
 }
 
-impl<E> Clone for CrashHolder<E>
-where
-    E: Debug + Display,
-{
+impl Clone for CrashHolder {
     fn clone(&self) -> Self {
         CrashHolder {
             crash: self.crash.clone(),
@@ -64,11 +58,8 @@ where
     }
 }
 
-impl<E> CrashHolder<E>
-where
-    E: Debug + Display,
-{
-    fn set_crash(&self, err: SubsystemError<E>) {
+impl CrashHolder {
+    fn set_crash(&self, err: SubsystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         if guard.is_ok() {
             *guard = Err(err);
@@ -76,7 +67,7 @@ where
         }
     }
 
-    fn take_crash(&self) -> SubsystemResult<E> {
+    fn take_crash(&self) -> SubsystemResult {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         mem::replace(&mut *guard, Ok(()))
     }
@@ -85,11 +76,11 @@ where
 impl RootBuilder {
     pub async fn start<E, F>(
         self,
-        subsys: impl FnOnce(SubsystemHandle<E>) -> F + Send + 'static,
-    ) -> SubsystemResult<E>
+        subsys: impl FnOnce(SubsystemHandle) -> F + Send + 'static,
+    ) -> SubsystemResult
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
-        E: Debug + Display + Send + Sync + 'static,
+        E: IntoGenericError + Display,
     {
         let global = CancellationToken::new();
         let local = global.child_token();
@@ -127,7 +118,10 @@ impl RootBuilder {
                     Ok(_) => info!("Root system '{}' terminated normally.", self.name),
                     Err(e) => {
                         error!("Root system '{}' terminated with error: {e}", self.name);
-                        crash.set_crash(SubsystemError::Error(self.name.clone(), e));
+                        crash.set_crash(SubsystemError::Error(
+                            self.name.clone(),
+                            e.into_generic_error(),
+                        ));
                     }
                 }
 
@@ -284,19 +278,44 @@ fn handle_unix_signal(
 }
 
 #[derive(Debug, Error, Diagnostic)]
-pub enum SubsystemError<E>
-where
-    E: Debug + Display,
-{
+pub enum SubsystemError {
     #[error("Subsystem '{0}' terminated with error: {1}")]
-    Error(String, E),
+    Error(String, GenericError),
     #[error("Subsystem '{0}' panicked: {1}")]
     Panic(String, String),
     #[error("Subsystem shutdown timed out")]
     ForcedShutdown,
 }
 
-pub type SubsystemResult<E> = Result<(), SubsystemError<E>>;
+pub trait GenErr: Debug + Display + Send + Sync + 'static {}
+
+impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
+
+pub struct GenericError(Box<dyn GenErr>);
+
+pub trait IntoGenericError {
+    fn into_generic_error(self) -> GenericError;
+}
+
+impl<E: GenErr> IntoGenericError for E {
+    fn into_generic_error(self) -> GenericError {
+        GenericError(Box::new(self))
+    }
+}
+
+impl fmt::Debug for GenericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl fmt::Display for GenericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub type SubsystemResult = Result<(), SubsystemError>;
 
 async fn wait_for_children_shutdown(
     children: &HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>,
@@ -307,23 +326,17 @@ async fn wait_for_children_shutdown(
     }
 }
 
-pub struct SubsystemHandle<E>
-where
-    E: Debug + Display + Send + Sync + 'static,
-{
+pub struct SubsystemHandle {
     name: String,
     local: CancellationToken,
     global: CancellationToken,
     cancel_clean_shutdown: CancellationToken,
     children: ChildMap,
-    crash: CrashHolder<E>,
+    crash: CrashHolder,
     join_handle: (watch::Sender<bool>, watch::Receiver<bool>),
 }
 
-impl<E> Clone for SubsystemHandle<E>
-where
-    E: Debug + Display + Send + Sync + 'static,
-{
+impl Clone for SubsystemHandle {
     fn clone(&self) -> Self {
         SubsystemHandle {
             name: self.name.clone(),
@@ -337,10 +350,7 @@ where
     }
 }
 
-impl<E> fmt::Debug for SubsystemHandle<E>
-where
-    E: Debug + Display + Send + Sync + 'static,
-{
+impl fmt::Debug for SubsystemHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SubsystemHandle")
             .field("name", &self.name)
@@ -348,21 +358,17 @@ where
     }
 }
 
-fn convert_result<E, Err>(res: Result<(), Err>) -> Result<(), E>
+fn convert_result<Err>(res: Result<(), Err>) -> Result<(), GenericError>
 where
-    E: Send + Sync + 'static,
-    Err: Send + Sync + 'static + Into<E>,
+    Err: IntoGenericError,
 {
     match res {
         Ok(_) => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e.into_generic_error()),
     }
 }
 
-impl<E> SubsystemHandle<E>
-where
-    E: Debug + Display + Send + Sync + 'static,
-{
+impl SubsystemHandle {
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -370,11 +376,11 @@ where
     pub fn spawn<Err, F>(
         &self,
         name: impl AsRef<str>,
-        subsys: impl FnOnce(SubsystemHandle<E>) -> F + Send + 'static,
-    ) -> SubsystemHandle<E>
+        subsys: impl FnOnce(SubsystemHandle) -> F + Send + 'static,
+    ) -> SubsystemHandle
     where
         F: Future<Output = Result<(), Err>> + Send + 'static,
-        Err: Debug + Display + Send + Sync + 'static + Into<E>,
+        Err: IntoGenericError,
     {
         let cancel_clean_shutdown = self.cancel_clean_shutdown.clone();
 
@@ -428,7 +434,7 @@ where
         &self,
         name: impl AsRef<str>,
         cancel_clean_shutdown: CancellationToken,
-    ) -> SubsystemHandle<E> {
+    ) -> SubsystemHandle {
         let (res_tx, res_rx) = watch::channel(false);
         let name = format!("{}/{}", self.name, name.as_ref());
         let global = self.global.clone();
@@ -451,10 +457,10 @@ where
     }
 
     async fn child_joined(
-        res: Result<Result<(), E>, JoinError>,
+        res: Result<Result<(), GenericError>, JoinError>,
         children: ChildMap,
         child_name: &str,
-        crash: &mut CrashHolder<E>,
+        crash: &mut CrashHolder,
     ) {
         let mut children = children.lock().expect("mutex is poisoned");
         let Some(child) = children.remove(child_name) else {
@@ -493,7 +499,7 @@ where
         join_handle: tokio::task::JoinHandle<Result<(), Err>>,
         child_name: &str,
         global: &CancellationToken,
-        crash: &mut CrashHolder<E>,
+        crash: &mut CrashHolder,
     ) where
         Err: Debug + Display + Send + Sync + 'static,
     {

@@ -46,17 +46,14 @@ async fn main() -> miette::Result<()> {
 
             root.shutdown_requested().await;
 
-            Ok(())
+            Ok::<(), miette::Report>(())
         })
         .await
         .into_diagnostic()?;
     Ok(())
 }
 
-async fn service_loop(
-    subsys: tosub::SubsystemHandle<miette::Report>,
-    duration: Duration,
-) -> miette::Result<()> {
+async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> miette::Result<()> {
     info!("Service {} started.", subsys.name());
 
     loop {
