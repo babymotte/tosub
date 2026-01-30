@@ -14,6 +14,7 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
 use miette::IntoDiagnostic;
 use std::{io, time::Duration};
 use tokio::time::sleep;
@@ -37,39 +38,22 @@ async fn main() -> miette::Result<()> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
+            root.request_global_shutdown();
+
             root.spawn("child 1", |subsystem| async move {
                 println!("Hello from {}", subsystem.name());
-                sleep(Duration::from_secs(1)).await;
-                panic!("Oopsie whoopsie!");
-                #[allow(unreachable_code)]
-                Ok::<(), miette::ErrReport>(())
-            });
 
-            root.spawn("child 2", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
+                subsystem.spawn("grandchild 1", |subsystem| async move {
+                    println!("Hello from {}", subsystem.name());
+                    subsystem.shutdown_requested().await;
+                    Ok::<(), miette::ErrReport>(())
+                });
+
                 subsystem.shutdown_requested().await;
-                println!("{} needs three seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(3)).await;
                 Ok::<(), miette::ErrReport>(())
             });
 
-            root.spawn("child 3", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs ten seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(10)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.spawn("child 4", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs twenty seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(20)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.shutdown_requested().await;
+            sleep(Duration::from_secs(1)).await;
             Ok::<(), miette::ErrReport>(())
         })
         .join()

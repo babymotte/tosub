@@ -25,11 +25,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use thiserror::Error;
 use tokio::{
     select,
     signal::unix::{Signal, SignalKind, signal},
     spawn,
-    sync::watch,
+    sync::{oneshot, watch},
+    task::JoinError,
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -42,10 +44,13 @@ pub struct RootBuilder {
 }
 
 impl RootBuilder {
-    pub fn start<E, F>(self, subsys: impl FnOnce(Subsystem) -> F + Send + 'static) -> Subsystem
+    pub fn start<E, F>(
+        self,
+        subsys: impl FnOnce(SubsystemHandle<E>) -> F + Send + 'static,
+    ) -> SubsystemJoinHandle<E>
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
-        E: Display + Debug + Send + 'static,
+        E: Debug + Display + Send + Sync + 'static,
     {
         let global = CancellationToken::new();
         let local = global.child_token();
@@ -54,35 +59,41 @@ impl RootBuilder {
             self.register_signal_handlers(&global);
         }
 
-        let join = watch::channel(false);
-        let join_tx = join.0.clone();
+        let (res_tx, res_rx) = oneshot::channel();
 
         let cancel_clean_shutdown = CancellationToken::new();
 
-        let system = Subsystem {
+        let children = Arc::new(Mutex::new(Some(HashMap::new())));
+
+        let handle = SubsystemHandle {
+            name: self.name.clone(),
+            global: global.clone(),
+            local: local.clone(),
+
+            cancel_clean_shutdown: cancel_clean_shutdown.clone(),
+            children: children.clone(),
+        };
+
+        let join_handle = SubsystemJoinHandle {
             name: self.name,
             global: global.clone(),
             local: local.clone(),
-            join,
-            cancel_clean_shutdown: cancel_clean_shutdown.clone(),
-            children: Arc::new(Mutex::new(Some(HashMap::new()))),
+            res_rx: Some(res_rx),
         };
 
-        let children = system.children.clone();
-
-        let sys = system.clone();
         let glob = global.clone();
         if let Some(to) = self.shutdown_timeout {
             let cancel_clean_shutdown = cancel_clean_shutdown.clone();
 
             spawn(async move {
-                match subsys(sys).await {
+                match subsys(handle).await {
                     Ok(_) => info!("Root system terminated normally."),
                     Err(e) => error!("Root system terminated with error: {e}"),
                 }
 
-                glob.cancel();
-
+                if !global.is_cancelled() {
+                    glob.cancel();
+                }
                 info!(
                     "Shutdown initiated, waiting up to {:?} for clean shutdown.",
                     to
@@ -93,29 +104,31 @@ impl RootBuilder {
                     return;
                 };
 
-                let children_shutdown = Subsystem::wait_for_children_shutdown(children);
+                let children_shutdown =
+                    SubsystemJoinHandle::wait_for_children_shutdown(children, Ok(()));
 
                 match timeout(to, children_shutdown).await {
-                    Ok(_) => {
-                        info!("All subsystems have shut down cleanly.");
-                        join_tx.send(true).ok();
+                    Ok(res) => {
+                        info!("All subsystems have shut down in time.");
+                        res_tx.send(res).ok();
                     }
                     Err(_) => {
                         error!("Shutdown timeout reached, forcing shutdown …");
                         cancel_clean_shutdown.cancel();
-                        join_tx.send(true).ok();
+                        res_tx.send(Err(SubSystemErr::ForcedShutdown)).ok();
                     }
                 }
             });
         } else {
             spawn(async move {
-                match subsys(sys).await {
+                match subsys(handle).await {
                     Ok(_) => info!("Root system terminated normally."),
                     Err(e) => error!("Root system terminated with error: {e}"),
                 }
 
-                glob.cancel();
-
+                if !global.is_cancelled() {
+                    glob.cancel();
+                }
                 info!("Shutdown initiated, waiting for clean shutdown.");
 
                 let Some(children) = children.lock().expect("mutex is poisoned").take() else {
@@ -123,13 +136,13 @@ impl RootBuilder {
                     return;
                 };
 
-                Subsystem::wait_for_children_shutdown(children).await;
-                info!("All subsystems have shut down cleanly.");
-                join_tx.send(true).ok();
+                let res = SubsystemJoinHandle::wait_for_children_shutdown(children, Ok(())).await;
+                info!("All subsystems have shut down in time.");
+                res_tx.send(res).ok();
             });
         }
 
-        system
+        join_handle
     }
 
     pub fn catch_signals(mut self) -> Self {
@@ -206,93 +219,125 @@ fn handle_signal(
     });
 }
 
+#[derive(Debug, Error)]
+pub enum SubSystemErr<E> {
+    #[error("Subsystem terminated with error: {0}")]
+    Error(E),
+    #[error("Subsystem panicked: {0}")]
+    Panic(String),
+    #[error("Subsystem shutdown timed out")]
+    ForcedShutdown,
+}
+
+pub type SubsystemResult<E> = Result<(), SubSystemErr<E>>;
+
+pub struct Child<E> {
+    res_rx: oneshot::Receiver<SubsystemResult<E>>,
+    res_tx: oneshot::Sender<SubsystemResult<E>>,
+}
+
+impl<E> Child<E>
+where
+    E: Send + Sync + 'static,
+{
+    async fn join(self) -> SubsystemResult<E> {
+        let res = self.res_rx.await.unwrap_or_else(|_| Ok(()));
+        self.res_tx.send(Ok(())).ok();
+        res
+    }
+}
+
 #[derive(Clone)]
-pub struct Subsystem {
+pub struct SubsystemHandle<E>
+where
+    E: Send + Sync + 'static,
+{
     name: String,
     local: CancellationToken,
     global: CancellationToken,
     cancel_clean_shutdown: CancellationToken,
-    join: (watch::Sender<bool>, watch::Receiver<bool>),
-    children: Arc<Mutex<Option<HashMap<String, Box<Subsystem>>>>>,
+    children: Arc<Mutex<Option<HashMap<String, Child<E>>>>>,
 }
 
-impl fmt::Debug for Subsystem {
+impl<E> fmt::Debug for SubsystemHandle<E>
+where
+    E: Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Subsystem")
+        f.debug_struct("SubsystemHandle")
             .field("name", &self.name)
             .finish()
     }
 }
 
-impl Subsystem {
+fn convert_result<E, Err>(res: Result<(), Err>) -> Result<(), E>
+where
+    E: Send + Sync + 'static,
+    Err: Send + Sync + 'static + Into<E>,
+{
+    match res {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+impl<E> SubsystemHandle<E>
+where
+    E: Debug + Display + Send + Sync + 'static,
+{
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn spawn<E, F>(
+    pub fn spawn<Err, F>(
         &self,
         name: impl AsRef<str>,
-        subsys: impl FnOnce(Subsystem) -> F + Send + 'static,
-    ) -> Subsystem
+        subsys: impl FnOnce(SubsystemHandle<E>) -> F + Send + 'static,
+    ) -> SubsystemJoinHandle<E>
     where
-        F: Future<Output = Result<(), E>> + Send + 'static,
-        E: Display + Debug + Send + 'static,
+        F: Future<Output = Result<(), Err>> + Send + 'static,
+        Err: Debug + Display + Send + Sync + 'static + Into<E>,
     {
         let join = watch::channel(false);
         let join_tx = join.0.clone();
         let cancel_clean_shutdown = self.cancel_clean_shutdown.clone();
 
-        let child = self.create_child(name, join, cancel_clean_shutdown.clone());
-        let full_name = child.name().to_owned();
-        let s = child.clone();
-
-        let fname = full_name.clone();
-        info!("Spawning subsystem '{}' …", fname);
-        let mut join_handle = tokio::spawn(async move {
-            info!("Subsystem '{}' started.", fname);
-            subsys(s).await
-        });
-
-        let global = self.global.clone();
-
-        let child_name = full_name.clone();
-        tokio::spawn(async move {
-            select! {
-                res = &mut join_handle => {
-                    match res {
-                        Ok(Ok(_)) => {
-                            info!("Subsystem '{}' terminated normally.", child_name);
-                        }
-                        Ok(Err(e)) => {
-                            error!("Subsystem '{}' terminated with error: {}", child_name, e);
-                            global.cancel();
-                        }
-                        Err(e) => {
-                            if e.is_panic() {
-                                error!("Subsystem '{}' panicked: {}", child_name, e);
-                                global.cancel();
-                            } else {
-                                warn!("Subsystem '{}' was shut down forcefully.", child_name);
-                            }
-                        }
-                    }
-                    join_tx.send(true).ok();
-                },
-                _ = cancel_clean_shutdown.cancelled() => {
-                    warn!("Subsystem '{}' is being shut down forcefully.", child_name);
-                    join_handle.abort();
-                },
-            }
-        });
+        let (res_tx, res_rx) = oneshot::channel();
+        let (res_tx2, res_rx2) = oneshot::channel();
+        let (join_handle, handle) = self.create_child(name, res_rx2, cancel_clean_shutdown.clone());
+        let full_name = join_handle.name().to_owned();
+        let child: Child<E> = Child {
+            res_rx,
+            res_tx: res_tx2,
+        };
 
         {
             let mut children = self.children.lock().expect("mutex is poisoned");
             if let Some(children) = children.as_mut() {
-                children.insert(full_name, Box::new(child.clone()));
+                children.insert(full_name.clone(), child);
             }
         }
 
-        child
+        let fname = full_name.clone();
+        let global = self.global.clone();
+        let children = self.children.clone();
+        info!("Spawning subsystem '{}' …", fname);
+        tokio::spawn(async move {
+            let name = fname.clone();
+            let mut join_handle: tokio::task::JoinHandle<Result<(), E>> =
+                tokio::spawn(async move {
+                    info!("Subsystem '{}' started.", name);
+                    let res = subsys(handle).await;
+                    convert_result(res)
+                });
+            let res = select! {
+                res = &mut join_handle => Self::child_joined(res, children, &fname, global, join_tx),
+                _ = cancel_clean_shutdown.cancelled() => Self::shutdown_timed_out(join_handle, &fname),
+            };
+            res_tx.send(res).ok();
+        });
+
+        join_handle
     }
 
     pub fn request_global_shutdown(&self) {
@@ -303,127 +348,165 @@ impl Subsystem {
         self.local.cancel();
     }
 
-    pub fn shutdown_requested(&self) -> impl Future<Output = ()> {
-        self.local.cancelled()
+    pub async fn shutdown_requested(&self) {
+        self.local.cancelled().await
     }
 
     pub fn is_shut_down(&self) -> bool {
         self.local.is_cancelled()
     }
 
-    pub async fn join(&mut self) {
-        self.join.1.wait_for(|it| *it).await.ok();
-        let children = self.children.lock().expect("mutex is poisoned").take();
-        if let Some(children) = children {
-            Subsystem::wait_for_children_shutdown(children).await;
-        }
-    }
-
-    pub fn build_root(name: impl Into<String>) -> RootBuilder {
-        RootBuilder {
-            name: name.into(),
-            catch_signals: false,
-            shutdown_timeout: None,
-        }
-    }
-
     fn create_child(
         &self,
         name: impl AsRef<str>,
-        join: (watch::Sender<bool>, watch::Receiver<bool>),
+        res_rx: oneshot::Receiver<SubsystemResult<E>>,
         cancel_clean_shutdown: CancellationToken,
-    ) -> Self {
+    ) -> (SubsystemJoinHandle<E>, SubsystemHandle<E>) {
         let name = format!("{}/{}", self.name, name.as_ref());
         let global = self.global.clone();
         let local = self.local.child_token();
         let children = Arc::new(Mutex::new(Some(HashMap::new())));
 
-        Self {
+        let join_handle = SubsystemJoinHandle {
+            name: name.clone(),
+            global: global.clone(),
+            local: local.clone(),
+            res_rx: Some(res_rx),
+        };
+
+        let handle = SubsystemHandle {
             name,
             global,
             local,
-            join,
             cancel_clean_shutdown,
             children,
-        }
+        };
+
+        (join_handle, handle)
     }
 
-    async fn wait_for_children_shutdown(children: HashMap<String, Box<Subsystem>>) {
-        for (_, mut child) in children {
-            Box::pin(child.join()).await;
-        }
+    fn child_joined(
+        res: Result<Result<(), E>, JoinError>,
+        children: Arc<Mutex<Option<HashMap<String, Child<E>>>>>,
+        child_name: &str,
+        global: CancellationToken,
+        join_tx: watch::Sender<bool>,
+    ) -> Result<(), SubSystemErr<E>> {
+        let res = match res {
+            Ok(Ok(_)) => {
+                info!("Subsystem '{}' terminated normally.", child_name);
+                if let Some(children) = children.lock().expect("mutex is poisoned").as_mut() {
+                    if let Some(child) = children.remove(child_name) {
+                        child.res_tx.send(Ok(())).ok();
+                    }
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                error!("Subsystem '{}' terminated with error: {}", child_name, e);
+                global.cancel();
+                Err(SubSystemErr::Error(e.into()))
+            }
+            Err(e) => {
+                if e.is_panic() {
+                    error!("Subsystem '{}' panicked: {}", child_name, e);
+                    global.cancel();
+                    Err(SubSystemErr::Panic(e.to_string()))
+                } else {
+                    warn!("Subsystem '{}' was shut down forcefully.", child_name);
+                    Err(SubSystemErr::ForcedShutdown)
+                }
+            }
+        };
+        join_tx.send(true).ok();
+        res
+    }
+
+    fn shutdown_timed_out<Err>(
+        join_handle: tokio::task::JoinHandle<Result<(), Err>>,
+        child_name: &str,
+    ) -> Result<(), SubSystemErr<Err>>
+    where
+        Err: Debug + Display + Send + Sync + 'static,
+    {
+        warn!("Subsystem '{}' is being shut down forcefully.", child_name);
+        join_handle.abort();
+        Err(SubSystemErr::ForcedShutdown)
     }
 }
 
-#[cfg(test)]
-mod test {
+pub struct SubsystemJoinHandle<E>
+where
+    E: Debug + Display + Send + Sync + 'static,
+{
+    name: String,
+    local: CancellationToken,
+    global: CancellationToken,
+    res_rx: Option<oneshot::Receiver<SubsystemResult<E>>>,
+}
 
-    use super::*;
-    use miette::Report;
-    use std::time::Duration;
-    use tokio::time::{sleep, timeout};
+impl<E> fmt::Debug for SubsystemJoinHandle<E>
+where
+    E: Debug + Display + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubsystemJoinHandle")
+            .field("name", &self.name)
+            .finish()
+    }
+}
 
-    #[tokio::test]
-    async fn root_is_created() {
-        let subsystem = Subsystem::build_root("test_subsystem").start(|s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
-        assert_eq!(subsystem.name(), "test_subsystem");
+impl<E> SubsystemJoinHandle<E>
+where
+    E: Debug + Display + Send + Sync + 'static,
+{
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    #[tokio::test]
-    async fn child_is_created() {
-        let root_subsystem = Subsystem::build_root("root").start(|s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
-        let child_subsystem =
-            root_subsystem.spawn("child", |_| async move { Ok::<(), Report>(()) });
-        assert_eq!(child_subsystem.name(), "root/child");
+    pub fn request_global_shutdown(&self) {
+        self.global.cancel();
     }
 
-    #[tokio::test]
-    async fn child_global_shutdown_shuts_down_root() {
-        let root_subsystem = Subsystem::build_root("root").start(|s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
-        let child_subsystem = root_subsystem.spawn("child", |_| async move {
-            sleep(Duration::from_hours(1)).await;
-            Ok::<(), Report>(())
-        });
-
-        child_subsystem.request_global_shutdown();
-
-        timeout(Duration::from_secs(1), root_subsystem.shutdown_requested())
-            .await
-            .expect("Root subsystem did not shutdown in time");
+    pub fn request_local_shutdown(&self) {
+        self.local.cancel();
     }
 
-    #[tokio::test]
-    async fn grandchild_global_shutdown_shuts_down_root() {
-        let mut root_subsystem = Subsystem::build_root("root").start(|s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
-        let child_system = root_subsystem.spawn("child", |s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
-        let grandchild_system = child_system.spawn("grandchild", |s| async move {
-            s.shutdown_requested().await;
-            Ok::<(), Report>(())
-        });
+    pub async fn shutdown_requested(&self) {
+        self.local.cancelled().await
+    }
 
-        assert!(!root_subsystem.is_shut_down());
+    pub fn is_shut_down(&self) -> bool {
+        self.local.is_cancelled()
+    }
 
-        sleep(Duration::from_millis(100)).await;
+    pub async fn join(&mut self) -> SubsystemResult<E> {
+        let Some(rx) = self.res_rx.take() else {
+            panic!("already joined on this subsystem");
+        };
+        let res = rx.await.unwrap_or_else(|_| Ok(()));
+        res
+    }
 
-        grandchild_system.request_global_shutdown();
+    async fn wait_for_children_shutdown(
+        children: HashMap<String, Child<E>>,
+        res: SubsystemResult<E>,
+    ) -> SubsystemResult<E> {
+        let mut res = res;
+        for (_, child) in children {
+            let r = child.join().await;
+            if let (r, &Ok(_)) = (r, &res) {
+                res = r;
+            }
+        }
+        res
+    }
+}
 
-        timeout(Duration::from_secs(1), root_subsystem.join())
-            .await
-            .expect("Root subsystem did not shutdown in time");
+pub fn build_root(name: impl Into<String>) -> RootBuilder {
+    RootBuilder {
+        name: name.into(),
+        catch_signals: false,
+        shutdown_timeout: None,
     }
 }

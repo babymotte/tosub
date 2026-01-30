@@ -15,6 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+use miette::IntoDiagnostic;
 use miette::miette;
 use std::{io, time::Duration};
 use tokio::time::sleep;
@@ -22,7 +23,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> miette::Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -34,7 +35,7 @@ async fn main() {
         )
         .init();
 
-    tosub::Subsystem::build_root("hello_world")
+    tosub::build_root("hello_world")
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
@@ -65,5 +66,7 @@ async fn main() {
             Ok::<(), miette::ErrReport>(())
         })
         .join()
-        .await;
+        .await
+        .into_diagnostic()?;
+    Ok(())
 }

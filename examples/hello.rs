@@ -1,10 +1,9 @@
+use miette::IntoDiagnostic;
 use std::{io, time::Duration};
-use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
-
 #[tokio::main]
-async fn main() {
+async fn main() -> miette::Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -16,7 +15,7 @@ async fn main() {
         )
         .init();
 
-    Subsystem::build_root("root")
+    tosub::build_root("root")
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
@@ -33,5 +32,7 @@ async fn main() {
             Ok::<(), miette::Report>(())
         })
         .join()
-        .await;
+        .await
+        .into_diagnostic()?;
+    Ok(())
 }

@@ -13,6 +13,8 @@ categories = ["asynchronous", "rust-patterns"]
 tokio-util = "0.7.18"
 tokio = { version = "1.49.0", features = ["rt", "time", "signal", "macros"] }
 tracing = "0.1.44"
+miette = "7.6.0"
+thiserror = "2.0.18"
 
 [dev-dependencies]
 tokio = { version = "1.49.0", features = ["full"] }

@@ -1,12 +1,11 @@
-use miette::Report;
+use miette::IntoDiagnostic;
 use std::{io, time::Duration};
 use tokio::{select, time::sleep};
-use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> miette::Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -18,7 +17,7 @@ async fn main() {
         )
         .init();
 
-    Subsystem::build_root("root")
+    tosub::build_root("root")
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|s| async move {
@@ -30,7 +29,7 @@ async fn main() {
                             _ = s.shutdown_requested() => break,
                         }
                     }
-                    Ok::<(), miette::Report>(())
+                    Ok::<(), miette::Error>(())
                 });
 
                 let mut tock = s.spawn("tock", |s| async move {
@@ -43,20 +42,24 @@ async fn main() {
                             _ = s.shutdown_requested() => break,
                         }
                     }
-                    Ok::<(), miette::Report>(())
+                    Ok::<(), miette::Error>(())
                 });
 
-                tick.join().await;
-                tock.join().await;
+                tick.join().await.into_diagnostic()?;
+                tock.join().await.into_diagnostic()?;
                 s.request_global_shutdown();
 
-                Ok::<(), miette::Report>(())
+                Ok::<(), miette::Error>(())
             })
             .join()
-            .await;
+            .await
+            .into_diagnostic()?;
 
-            Ok::<(), Report>(())
+            Ok::<(), miette::Error>(())
         })
         .join()
-        .await;
+        .await
+        .into_diagnostic()?;
+
+    Ok(())
 }

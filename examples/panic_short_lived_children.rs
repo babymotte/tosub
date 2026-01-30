@@ -35,63 +35,38 @@ async fn main() -> miette::Result<()> {
 
     tosub::build_root("hello_world")
         .catch_signals()
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(Duration::from_secs(1))
         .start(|root| async move {
             root.spawn("child 1", |subsystem| async move {
                 println!("Hello from {}", subsystem.name());
-
-                subsystem.spawn("grandchild 1", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
-                    subsystem.shutdown_requested().await;
-                    println!("{} shuts down immedaiately.", subsystem.name());
+                println!("Bye from {}", subsystem.name());
+                Ok::<(), miette::ErrReport>(())
+            });
+            root.spawn("child 2", |subsystem| async move {
+                println!("Hello from {}", subsystem.name());
+                subsystem.spawn("child 1", |subsubsystem| async move {
+                    println!("Hello from {}", subsubsystem.name());
+                    sleep(Duration::from_millis(50)).await;
+                    subsubsystem.shutdown_requested().await;
+                    println!("Bye from {}", subsubsystem.name());
                     Ok::<(), miette::ErrReport>(())
                 });
+                sleep(Duration::from_millis(100)).await;
+                println!("Bye from {}", subsystem.name());
+                Ok::<(), miette::ErrReport>(())
+            });
+            root.spawn("child 3", |subsystem| async move {
+                println!("Hello from {}", subsystem.name());
+                sleep(Duration::from_millis(200)).await;
+                println!("Bye from {}", subsystem.name());
+                Ok::<(), miette::ErrReport>(())
+            });
 
-                subsystem.spawn("grandchild 2", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
-
-                    subsystem.spawn("great grandchild 1", |subsystem| async move {
-                        println!("Hello from {}", subsystem.name());
-                        subsystem.shutdown_requested().await;
-                        println!("{} needs a second to shut down ...", subsystem.name());
-                        sleep(Duration::from_secs(1)).await;
-                        Ok::<(), miette::ErrReport>(())
-                    });
-
-                    subsystem.shutdown_requested().await;
-                    println!("{} needs a second to shut down ...", subsystem.name());
-                    sleep(Duration::from_secs(1)).await;
-                    Ok::<(), miette::ErrReport>(())
-                });
-
+            root.spawn("child 4", |subsystem| async move {
+                println!("Hello from {}", subsystem.name());
                 sleep(Duration::from_secs(1)).await;
                 panic!("Oopsie whoopsie!");
                 #[allow(unreachable_code)]
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.spawn("child 2", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-
-                subsystem.spawn("grandchild 3", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
-                    subsystem.shutdown_requested().await;
-                    println!("{} needs two second to shut down ...", subsystem.name());
-                    sleep(Duration::from_secs(2)).await;
-                    Ok::<(), miette::ErrReport>(())
-                });
-
-                subsystem.shutdown_requested().await;
-                println!("{} needs two seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(2)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.spawn("child 3", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs three seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(3)).await;
                 Ok::<(), miette::ErrReport>(())
             });
 
