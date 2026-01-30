@@ -14,11 +14,10 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 use miette::IntoDiagnostic;
-use miette::miette;
 use std::{io, time::Duration};
 use tokio::time::sleep;
+use tosub::SubsystemHandle;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -38,34 +37,14 @@ async fn main() -> miette::Result<()> {
     tosub::build_root("hello_world")
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
-        .start(|root| async move {
-            root.spawn("child 1", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                sleep(Duration::from_secs(1)).await;
-                Err(miette!("Oopsie whoopsie!"))
-            });
-
-            root.spawn("child 2", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs a seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(1)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.spawn("child 3", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs two seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(2)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
-
-            root.shutdown_requested().await;
-
-            Ok::<(), miette::ErrReport>(())
-        })
+        .start(run)
         .await
         .into_diagnostic()?;
+    Ok(())
+}
+
+async fn run(subsys: SubsystemHandle<miette::Report>) -> miette::Result<()> {
+    println!("Hello from {}", subsys.name());
+    sleep(Duration::from_secs(2)).await;
     Ok(())
 }

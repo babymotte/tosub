@@ -31,7 +31,6 @@ async fn main() -> miette::Result<()> {
             root.shutdown_requested().await;
             Ok::<(), miette::Report>(())
         })
-        .join()
         .await
         .into_diagnostic()?;
     Ok(())

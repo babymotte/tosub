@@ -114,7 +114,6 @@ async fn main() -> miette::Result<()> {
             root.shutdown_requested().await;
             Ok::<(), miette::ErrReport>(())
         })
-        .join()
         .await
         .into_diagnostic()?;
     Ok(())

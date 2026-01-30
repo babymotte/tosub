@@ -22,7 +22,7 @@ async fn main() -> miette::Result<()> {
         .with_timeout(Duration::from_secs(5))
         .start(|s| async move {
             s.spawn("branch", |s| async move {
-                let mut tick = s.spawn("tick", |s| async move {
+                let tick = s.spawn("tick", |s| async move {
                     for i in 0..10 {
                         select! {
                             _ = sleep(Duration::from_millis(950)) => println!("tick {i}"),
@@ -32,7 +32,7 @@ async fn main() -> miette::Result<()> {
                     Ok::<(), miette::Error>(())
                 });
 
-                let mut tock = s.spawn("tock", |s| async move {
+                let tock = s.spawn("tock", |s| async move {
                     for i in 0..10 {
                         if i == 4 {
                             return Err(miette::miette!("Oh noes!"));
@@ -45,19 +45,17 @@ async fn main() -> miette::Result<()> {
                     Ok::<(), miette::Error>(())
                 });
 
-                tick.join().await.into_diagnostic()?;
-                tock.join().await.into_diagnostic()?;
+                tick.join().await;
+                tock.join().await;
                 s.request_global_shutdown();
 
                 Ok::<(), miette::Error>(())
             })
             .join()
-            .await
-            .into_diagnostic()?;
+            .await;
 
             Ok::<(), miette::Error>(())
         })
-        .join()
         .await
         .into_diagnostic()?;
 

@@ -73,7 +73,6 @@ async fn main() -> miette::Result<()> {
 
             Ok::<(), miette::ErrReport>(())
         })
-        .join()
         .await
         .into_diagnostic()?;
     Ok(())

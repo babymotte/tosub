@@ -56,7 +56,6 @@ async fn main() -> miette::Result<()> {
             sleep(Duration::from_secs(1)).await;
             Ok::<(), miette::ErrReport>(())
         })
-        .join()
         .await
         .into_diagnostic()?;
     Ok(())
