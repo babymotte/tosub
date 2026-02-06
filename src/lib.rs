@@ -34,9 +34,9 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-type ChildMap = Arc<Mutex<HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>>>;
+type SubsystemMap = Arc<Mutex<HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>>>;
 
 pub struct RootBuilder {
     name: String,
@@ -99,14 +99,14 @@ impl RootBuilder {
 
         let cancel_clean_shutdown = CancellationToken::new();
 
-        let children = Arc::new(Mutex::new(HashMap::new()));
+        let subsystems = Arc::new(Mutex::new(HashMap::new()));
 
         let handle = SubsystemHandle {
             name: self.name.clone(),
             global: global.clone(),
             local: local.clone(),
             cancel_clean_shutdown: cancel_clean_shutdown.clone(),
-            children: children.clone(),
+            subsystems: subsystems.clone(),
             crash: crash.clone(),
             join_handle: (join_tx.clone(), join_rx),
         };
@@ -127,17 +127,17 @@ impl RootBuilder {
 
                 glob.cancel();
                 info!(
-                    "Shutdown initiated, waiting up to {:?} for clean shutdown.",
+                    "Shutdown initiated, waiting for clean shutdown for up to {:?}.",
                     to
                 );
 
-                let children = {
-                    let children = children.lock().expect("mutex is poisoned");
-                    children.clone()
+                let subsystems = {
+                    let subsystems = subsystems.lock().expect("mutex is poisoned");
+                    subsystems.clone()
                 };
-                let children_shutdown = wait_for_children_shutdown(&children);
+                let subsys_shutdown_future = wait_for_subsystems_shutdown(&subsystems);
 
-                match timeout(to, children_shutdown).await {
+                match timeout(to, subsys_shutdown_future).await {
                     Ok(_) => {
                         info!("All subsystems have shut down in time.");
                     }
@@ -163,12 +163,12 @@ impl RootBuilder {
                 }
                 info!("Shutdown initiated, waiting for clean shutdown.");
 
-                let children = {
-                    let children = children.lock().expect("mutex is poisoned");
-                    children.clone()
+                let subsystems = {
+                    let subsystems = subsystems.lock().expect("mutex is poisoned");
+                    subsystems.clone()
                 };
-                let children_shutdown = wait_for_children_shutdown(&children);
-                children_shutdown.await;
+                let subsys_shutdown_future = wait_for_subsystems_shutdown(&subsystems);
+                subsys_shutdown_future.await;
                 info!("All subsystems have shut down.");
 
                 res_tx.send(crash.take_crash()).ok();
@@ -317,11 +317,11 @@ impl fmt::Display for GenericError {
 
 pub type SubsystemResult = Result<(), SubsystemError>;
 
-async fn wait_for_children_shutdown(
-    children: &HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>,
+async fn wait_for_subsystems_shutdown(
+    subsystems: &HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>,
 ) {
-    for child in children.values() {
-        let mut rx = child.1.clone();
+    for subsystem in subsystems.values() {
+        let mut rx = subsystem.1.clone();
         rx.wait_for(|it| *it).await.ok();
     }
 }
@@ -331,7 +331,7 @@ pub struct SubsystemHandle {
     local: CancellationToken,
     global: CancellationToken,
     cancel_clean_shutdown: CancellationToken,
-    children: ChildMap,
+    subsystems: SubsystemMap,
     crash: CrashHolder,
     join_handle: (watch::Sender<bool>, watch::Receiver<bool>),
 }
@@ -343,7 +343,7 @@ impl Clone for SubsystemHandle {
             local: self.local.clone(),
             global: self.global.clone(),
             cancel_clean_shutdown: self.cancel_clean_shutdown.clone(),
-            children: self.children.clone(),
+            subsystems: self.subsystems.clone(),
             crash: self.crash.clone(),
             join_handle: (self.join_handle.0.clone(), self.join_handle.1.clone()),
         }
@@ -388,7 +388,7 @@ impl SubsystemHandle {
         let full_name = handle.name().to_owned();
 
         let fname = full_name.clone();
-        let children = self.children.clone();
+        let subsystems = self.subsystems.clone();
         let mut crash = self.crash.clone();
         let glob = self.global.clone();
         let h = handle.clone();
@@ -401,7 +401,7 @@ impl SubsystemHandle {
                 convert_result(res)
             });
             select! {
-                res = &mut join_handle => Self::child_joined(res, children, &fname, &mut crash).await,
+                res = &mut join_handle => Self::subsystem_joined(res, subsystems, &fname, &mut crash).await,
                 _ = cancel_clean_shutdown.cancelled() => Self::shutdown_timed_out(join_handle, &fname, &glob, &mut crash).await,
             };
         });
@@ -439,10 +439,10 @@ impl SubsystemHandle {
         let name = format!("{}/{}", self.name, name.as_ref());
         let global = self.global.clone();
         let local = self.local.child_token();
-        let children = self.children.clone();
+        let subsystems = self.subsystems.clone();
         let crash = self.crash.clone();
 
-        let mut gc = self.children.lock().expect("mutex is poisoned");
+        let mut gc = self.subsystems.lock().expect("mutex is poisoned");
         gc.insert(name.clone(), (res_tx.clone(), res_rx.clone()));
 
         SubsystemHandle {
@@ -450,46 +450,58 @@ impl SubsystemHandle {
             global,
             local,
             cancel_clean_shutdown,
-            children,
+            subsystems,
             crash,
             join_handle: (res_tx, res_rx),
         }
     }
 
-    async fn child_joined(
+    async fn subsystem_joined(
         res: Result<Result<(), GenericError>, JoinError>,
-        children: ChildMap,
-        child_name: &str,
+        subsystems: SubsystemMap,
+        subsystem_name: &str,
         crash: &mut CrashHolder,
     ) {
-        let mut children = children.lock().expect("mutex is poisoned");
-        let Some(child) = children.remove(child_name) else {
-            warn!("Subsystem '{}' already removed from tracking.", child_name);
+        let mut subsystems = subsystems.lock().expect("mutex is poisoned");
+        let Some(subsys) = subsystems.remove(subsystem_name) else {
+            warn!(
+                "Subsystem '{}' already removed from tracking.",
+                subsystem_name
+            );
             return;
         };
 
+        debug!(
+            "Subsystem '{}' removed. Remaining subsystems: {:?}",
+            subsystem_name,
+            subsystems.keys()
+        );
+
         match res {
             Ok(Ok(_)) => {
-                info!("Subsystem '{}' terminated normally.", child_name);
-                child.0.send(true).ok();
+                info!("Subsystem '{}' terminated normally.", subsystem_name);
+                subsys.0.send(true).ok();
             }
             Ok(Err(e)) => {
-                error!("Subsystem '{}' terminated with error: {}", child_name, e);
-                let err = SubsystemError::Error(child_name.to_owned(), e);
+                error!(
+                    "Subsystem '{}' terminated with error: {}",
+                    subsystem_name, e
+                );
+                let err = SubsystemError::Error(subsystem_name.to_owned(), e);
                 crash.set_crash(err);
-                child.0.send(true).ok();
+                subsys.0.send(true).ok();
             }
             Err(e) => {
                 if e.is_panic() {
-                    error!("Subsystem '{}' panicked: {}", child_name, e);
-                    let err = SubsystemError::Panic(child_name.to_owned(), e.to_string());
+                    error!("Subsystem '{}' panicked: {}", subsystem_name, e);
+                    let err = SubsystemError::Panic(subsystem_name.to_owned(), e.to_string());
                     crash.set_crash(err);
-                    child.0.send(true).ok();
+                    subsys.0.send(true).ok();
                 } else {
-                    warn!("Subsystem '{}' was shut down forcefully.", child_name);
+                    warn!("Subsystem '{}' was shut down forcefully.", subsystem_name);
                     let err = SubsystemError::ForcedShutdown;
                     crash.set_crash(err);
-                    child.0.send(true).ok();
+                    subsys.0.send(true).ok();
                 }
             }
         };
@@ -497,13 +509,16 @@ impl SubsystemHandle {
 
     async fn shutdown_timed_out<Err>(
         join_handle: tokio::task::JoinHandle<Result<(), Err>>,
-        child_name: &str,
+        subsystem_name: &str,
         global: &CancellationToken,
         crash: &mut CrashHolder,
     ) where
         Err: Debug + Display + Send + Sync + 'static,
     {
-        warn!("Subsystem '{}' is being shut down forcefully.", child_name);
+        warn!(
+            "Subsystem '{}' is being shut down forcefully.",
+            subsystem_name
+        );
         join_handle.abort();
         global.cancel();
         crash.set_crash(SubsystemError::ForcedShutdown);

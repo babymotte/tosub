@@ -15,12 +15,13 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use miette::IntoDiagnostic;
+use miette::{IntoDiagnostic, miette};
 use std::{io, time::Duration};
 use tokio::select;
 use tokio::time::sleep;
-use tracing::info;
+use tosub::SubsystemHandle;
 use tracing::level_filters::LevelFilter;
+use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -30,7 +31,6 @@ async fn main() -> miette::Result<()> {
             fmt::Layer::new().with_writer(io::stderr).with_filter(
                 EnvFilter::builder()
                     .with_default_directive(LevelFilter::INFO.into())
-                    .with_env_var("WORTERBUCH_LOG")
                     .from_env_lossy(),
             ),
         )
@@ -40,9 +40,9 @@ async fn main() -> miette::Result<()> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
-            root.spawn("service 1", |s| service_loop(s, Duration::from_secs(2)));
-            root.spawn("service 2", |s| service_loop(s, Duration::from_secs(5)));
-            root.spawn("service 3", |s| service_loop(s, Duration::from_secs(10)));
+            root.spawn("service 1", |s| service_loop(s, Duration::from_secs(3)));
+            root.spawn("service 2", |s| service_loop(s, Duration::from_secs(7)));
+            root.spawn("service 3", |s| service_loop(s, Duration::from_secs(11)));
 
             root.shutdown_requested().await;
 
@@ -57,15 +57,14 @@ async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> mie
     info!("Service {} started.", subsys.name());
 
     loop {
+        let d = duration.clone();
+        let runner = subsys.spawn("runner", move |s| service_runner(s, d.clone()));
         select! {
-            res = service_runner(duration) => {
-                match res {
-                    Ok(_) => break,
-                    Err(e) => info!("Service {} runner finished with error: {}, restarting...", subsys.name(), e),
-                }
+            _ = runner.join() => {
+                info!("Service {} runner stopped. Restarting...", subsys.name());
             },
             _ = subsys.shutdown_requested() => {
-                info!("Service {} received shutdown request", subsys.name());
+                info!("Service {} received shutdown request.", subsys.name());
                 break;
             },
         }
@@ -74,8 +73,25 @@ async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> mie
     Ok(())
 }
 
-async fn service_runner(duration: Duration) -> miette::Result<()> {
-    info!("Service started.");
-    sleep(duration).await;
-    Err(miette::miette!("Simulated error"))
+async fn service_runner(s: SubsystemHandle, duration: Duration) -> miette::Result<()> {
+    info!("Service {} started.\n", s.name());
+
+    let simulated_work = async {
+        sleep(duration).await;
+        Err::<(), miette::Report>(miette!("Simulated error in service {}", s.name()))
+    };
+
+    select! {
+        res = simulated_work => if let Err(e) = res {
+            // catch error and return normally to prevent shutting down the whole system
+            error!("Service {} encountered an error: {e}", s.name());
+            return Ok(());
+        },
+        _ = s.shutdown_requested() => {
+            info!("Service {} received shutdown request.", s.name());
+            return Ok(());
+        },
+    }
+
+    Ok(())
 }
