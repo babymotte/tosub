@@ -27,7 +27,7 @@ async fn main() -> miette::Result<()> {
             fmt::Layer::new().with_writer(io::stderr).with_filter(
                 EnvFilter::builder()
                     .with_default_directive(LevelFilter::INFO.into())
-                                        .from_env_lossy(),
+                    .from_env_lossy(),
             ),
         )
         .init();
