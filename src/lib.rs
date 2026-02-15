@@ -22,7 +22,8 @@ use miette::Diagnostic;
 use std::{
     collections::HashMap,
     fmt::{self, Debug, Display},
-    mem, process,
+    mem,
+    process::{self, ExitCode},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -59,6 +60,14 @@ impl Clone for CrashHolder {
 }
 
 impl CrashHolder {
+    fn set_exit_code(&self, code: ExitCode) {
+        let mut guard = self.crash.lock().expect("mutex is poisoned");
+        if guard.is_ok() {
+            *guard = Ok(code);
+            self.cancel.cancel();
+        }
+    }
+
     fn set_crash(&self, err: SubsystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         if guard.is_ok() {
@@ -69,7 +78,7 @@ impl CrashHolder {
 
     fn take_crash(&self) -> SubsystemResult {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        mem::replace(&mut *guard, Ok(()))
+        mem::replace(&mut *guard, Ok(ExitCode::SUCCESS))
     }
 }
 
@@ -85,14 +94,14 @@ impl RootBuilder {
         let global = CancellationToken::new();
         let local = global.child_token();
 
-        if self.catch_signals {
-            self.register_signal_handlers(&global);
-        }
-
         let crash = CrashHolder {
-            crash: Arc::new(Mutex::new(Ok(()))),
+            crash: Arc::new(Mutex::new(Ok(ExitCode::SUCCESS))),
             cancel: global.clone(),
         };
+
+        if self.catch_signals {
+            self.register_signal_handlers(&global, crash.clone());
+        }
 
         let (res_tx, res_rx) = oneshot::channel();
         let (join_tx, join_rx) = watch::channel(false);
@@ -210,7 +219,7 @@ impl RootBuilder {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-    fn register_signal_handlers(&self, global: &CancellationToken) {
+    fn register_signal_handlers(&self, global: &CancellationToken, crash: CrashHolder) {
         use tokio::signal::unix::{SignalKind, signal};
 
         if let Ok(signal) = signal(SignalKind::hangup()) {
@@ -219,6 +228,7 @@ impl RootBuilder {
                 signal,
                 "SIGHUP",
                 SignalKind::hangup().as_raw_value(),
+                crash.clone(),
             );
         } else {
             error!("Failed to register SIGHUP handler");
@@ -230,13 +240,20 @@ impl RootBuilder {
                 signal,
                 "SIGINT",
                 SignalKind::interrupt().as_raw_value(),
+                crash.clone(),
             );
         } else {
             error!("Failed to register SIGINT handler");
         }
 
         if let Ok(signal) = signal(SignalKind::quit()) {
-            handle_unix_signal(global, signal, "SIGQUIT", SignalKind::quit().as_raw_value());
+            handle_unix_signal(
+                global,
+                signal,
+                "SIGQUIT",
+                SignalKind::quit().as_raw_value(),
+                crash.clone(),
+            );
         } else {
             error!("Failed to register SIGQUIT handler");
         }
@@ -247,6 +264,7 @@ impl RootBuilder {
                 signal,
                 "SIGTERM",
                 SignalKind::terminate().as_raw_value(),
+                crash.clone(),
             );
         } else {
             error!("Failed to register SIGTERM handler");
@@ -260,6 +278,7 @@ fn handle_unix_signal(
     mut signal: tokio::signal::unix::Signal,
     signal_name: &'static str,
     code: i32,
+    crash: CrashHolder,
 ) {
     let global = global.clone();
     spawn(async move {
@@ -271,6 +290,7 @@ fn handle_unix_signal(
                 break;
             }
             info!("Received {signal_name} signal, initiating shutdown.");
+            crash.set_exit_code(ExitCode::from(128 + code as u8));
             global.cancel();
         }
         process::exit(128 + code);
@@ -315,7 +335,7 @@ impl fmt::Display for GenericError {
     }
 }
 
-pub type SubsystemResult = Result<(), SubsystemError>;
+pub type SubsystemResult = Result<ExitCode, SubsystemError>;
 
 async fn wait_for_subsystems_shutdown(
     subsystems: &HashMap<String, (watch::Sender<bool>, watch::Receiver<bool>)>,

@@ -14,14 +14,15 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-use miette::IntoDiagnostic;
+
 use std::{io, time::Duration};
 use tokio::time::sleep;
+use tosub::SubsystemResult;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn main() -> SubsystemResult {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -32,88 +33,110 @@ async fn main() -> miette::Result<()> {
         )
         .init();
 
-    tosub::build_root("hello_world")
+    let root = tosub::build_root("hello_world")
         .catch_signals()
-        .with_timeout(Duration::from_secs(5))
-        .start(|root| async move {
-            root.spawn("child 1", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
+        .with_timeout(Duration::from_secs(5));
 
-                subsystem.spawn("grandchild 1", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
-                    subsystem.shutdown_requested().await;
-                    println!("{} shuts down immedaiately.", subsystem.name());
-                    Ok::<(), miette::ErrReport>(())
-                });
+    // tosub lets you recover the exit code matching the signal that stopped the process.
+    // it is for the application developer to decide if on a clean shutdown an exit code of 0 or
+    // the one matching the signal should be returned.
+    let exit_code = root.start(run).await?;
 
-                subsystem.spawn("grandchild 2", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
+    // in this case we try to return the exit code matching the signal, however this line of code will
+    // never be reached since the elapsing shutdown timeout will trigger an error in the previous line,
+    // ending the process with an exit code of 1.
+    Ok(exit_code)
+}
 
-                    subsystem.spawn("great grandchild 1", |subsystem| async move {
-                        println!("Hello from {}", subsystem.name());
-                        subsystem.shutdown_requested().await;
-                        println!("{} needs a second to shut down ...", subsystem.name());
-                        sleep(Duration::from_secs(1)).await;
-                        Ok::<(), miette::ErrReport>(())
-                    });
+async fn run(root: tosub::SubsystemHandle) -> miette::Result<()> {
+    root.spawn("child 1", child1);
+    root.spawn("child 2", child2);
+    root.spawn("child 3", child3);
 
-                    subsystem.spawn("great grandchild 2", |subsystem| async move {
-                        println!("Hello from {}", subsystem.name());
-                        subsystem.shutdown_requested().await;
-                        println!("{} needs six seconds to shut down ...", subsystem.name());
-                        sleep(Duration::from_secs(6)).await;
-                        Ok::<(), miette::ErrReport>(())
-                    });
+    root.shutdown_requested().await;
 
-                    subsystem.spawn("great grandchild 3", |subsystem| async move {
-                        println!("Hello from {}", subsystem.name());
-                        subsystem.shutdown_requested().await;
-                        println!("{} needs ten seconds to shut down ...", subsystem.name());
-                        sleep(Duration::from_secs(10)).await;
-                        Ok::<(), miette::ErrReport>(())
-                    });
+    Ok(())
+}
 
-                    subsystem.shutdown_requested().await;
-                    println!("{} needs a second to shut down ...", subsystem.name());
-                    sleep(Duration::from_secs(1)).await;
-                    Ok::<(), miette::ErrReport>(())
-                });
+async fn child1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
 
-                subsystem.shutdown_requested().await;
-                println!("{} needs a second to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(1)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
+    subsystem.spawn("grandchild 1", grandchild1);
+    subsystem.spawn("grandchild 2", grandchild2);
 
-            root.spawn("child 2", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
+    subsystem.shutdown_requested().await;
 
-                subsystem.spawn("grandchild 3", |subsystem| async move {
-                    println!("Hello from {}", subsystem.name());
-                    subsystem.shutdown_requested().await;
-                    println!("{} needs twenty seconds to shut down ...", subsystem.name());
-                    sleep(Duration::from_secs(20)).await;
-                    Ok::<(), miette::ErrReport>(())
-                });
+    println!("{} needs a second to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(1)).await;
 
-                subsystem.shutdown_requested().await;
-                println!("{} needs two seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(2)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
+    Ok(())
+}
 
-            root.spawn("child 3", |subsystem| async move {
-                println!("Hello from {}", subsystem.name());
-                subsystem.shutdown_requested().await;
-                println!("{} needs three seconds to shut down ...", subsystem.name());
-                sleep(Duration::from_secs(3)).await;
-                Ok::<(), miette::ErrReport>(())
-            });
+async fn grandchild2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
 
-            root.shutdown_requested().await;
-            Ok::<(), miette::ErrReport>(())
-        })
-        .await
-        .into_diagnostic()?;
+    subsystem.spawn("great grandchild 1", great_grandchild1);
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} needs a second to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(1)).await;
+
+    Ok(())
+}
+
+async fn great_grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} needs ten seconds to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(10)).await;
+
+    Ok(())
+}
+
+async fn grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} shuts down immedaiately.", subsystem.name());
+
+    Ok(())
+}
+
+async fn child2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
+
+    subsystem.spawn("grandchild 3", grandchild3);
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} needs two seconds to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(2)).await;
+
+    Ok(())
+}
+
+async fn grandchild3(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} needs two second to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(2)).await;
+
+    Ok(())
+}
+
+async fn child3(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+    println!("Hello from {}", subsystem.name());
+
+    subsystem.shutdown_requested().await;
+
+    println!("{} needs thirty seconds to shut down ...", subsystem.name());
+    sleep(Duration::from_secs(30)).await;
+
     Ok(())
 }

@@ -14,11 +14,11 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-use miette::IntoDiagnostic;
+
 use std::{io, time::Duration};
-use tokio::time::sleep;
+use tokio::{select, time::sleep};
 use tosub::SubsystemHandle;
-use tracing::level_filters::LevelFilter;
+use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -37,13 +37,28 @@ async fn main() -> miette::Result<()> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(run)
-        .await
-        .into_diagnostic()?;
+        .await?;
+
     Ok(())
 }
 
 async fn run(subsys: SubsystemHandle) -> miette::Result<()> {
     println!("Hello from {}", subsys.name());
-    sleep(Duration::from_secs(2)).await;
+
+    select! {
+        _ = async {
+            info!("Doing some work, this should take about two seconds. Press Ctrl+C to stop...");
+            sleep(Duration::from_secs(2)).await;
+        } => (),
+        _ = subsys.shutdown_requested() => (),
+    }
+
+    info!(
+        "Stopped. Cleaning up, this should take about one second. Press Ctrl+C to exit immediately..."
+    );
+
+    // do some cleanup here
+    sleep(Duration::from_secs(1)).await;
+
     Ok(())
 }
