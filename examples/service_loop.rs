@@ -57,8 +57,7 @@ async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> mie
     info!("Service {} started.", subsys.name());
 
     loop {
-        let d = duration.clone();
-        let runner = subsys.spawn("runner", move |s| service_runner(s, d.clone()));
+        let runner = subsys.spawn("runner", move |s| service_runner(s, duration));
         select! {
             _ = runner.join() => {
                 info!("Service {} runner stopped. Restarting...", subsys.name());

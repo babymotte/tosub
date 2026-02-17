@@ -49,9 +49,9 @@ async fn main() -> miette::Result<()> {
 }
 
 async fn run(root: SubsystemHandle) -> miette::Result<()> {
-    root.spawn("1", move |s| run_subsys(s));
-    root.spawn("2", move |s| run_subsys(s));
-    root.spawn("3", move |s| run_subsys(s));
+    root.spawn("1", run_subsys);
+    root.spawn("2", run_subsys);
+    root.spawn("3", run_subsys);
     root.shutdown_requested().await;
     Ok(())
 }
