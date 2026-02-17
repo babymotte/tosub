@@ -199,7 +199,7 @@ impl RootBuilder {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-    fn register_signal_handlers(&self, global: &CancellationToken) {
+    fn register_signal_handlers(&self, global: &CancellationToken, _: CrashHolder) {
         use tokio::signal::ctrl_c;
 
         let global = global.clone();
