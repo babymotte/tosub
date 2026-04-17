@@ -441,6 +441,10 @@ impl SubsystemHandle {
         self.local.cancelled().await
     }
 
+    pub async fn into_shutdown_requested(self) {
+        self.local.cancelled().await
+    }
+
     pub fn is_shut_down(&self) -> bool {
         self.local.is_cancelled()
     }
