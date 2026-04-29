@@ -22,9 +22,11 @@ use miette::Diagnostic;
 use std::{
     collections::HashMap,
     fmt::{self, Debug, Display},
+    io::stdin,
     mem,
     process::{self, ExitCode},
     sync::{Arc, Mutex},
+    thread,
     time::Duration,
 };
 use thiserror::Error;
@@ -43,6 +45,8 @@ pub struct RootBuilder {
     name: String,
     catch_signals: bool,
     shutdown_timeout: Option<std::time::Duration>,
+    shutdown_on_stdin_close: bool,
+    stdin_consumer: Option<Box<dyn Fn(String) + Send + 'static>>,
 }
 
 struct CrashHolder {
@@ -84,7 +88,7 @@ impl CrashHolder {
 
 impl RootBuilder {
     pub async fn start<E, F>(
-        self,
+        mut self,
         subsys: impl FnOnce(SubsystemHandle) -> F + Send + 'static,
     ) -> SubsystemResult
     where
@@ -101,6 +105,17 @@ impl RootBuilder {
 
         if self.catch_signals {
             self.register_signal_handlers(&global, crash.clone());
+        }
+
+        let stdin_consumer = self.stdin_consumer.take();
+        let shutdown_on_stdin_close = self.shutdown_on_stdin_close;
+        if stdin_consumer.is_none() || shutdown_on_stdin_close {
+            self.register_stdin_handler(
+                &global,
+                crash.clone(),
+                shutdown_on_stdin_close,
+                stdin_consumer,
+            );
         }
 
         let (res_tx, res_rx) = oneshot::channel();
@@ -193,8 +208,38 @@ impl RootBuilder {
         self
     }
 
+    pub fn catch_no_signals(mut self) -> Self {
+        self.catch_signals = false;
+        self
+    }
+
+    pub fn shutdown_on_stdin_close(mut self) -> Self {
+        self.shutdown_on_stdin_close = true;
+        self
+    }
+
+    pub fn no_shutdown_on_stdin_close(mut self) -> Self {
+        self.shutdown_on_stdin_close = false;
+        self
+    }
+
     pub fn with_timeout(mut self, shutdown_timeout: Duration) -> Self {
         self.shutdown_timeout = Some(shutdown_timeout);
+        self
+    }
+
+    pub fn without_timeout(mut self) -> Self {
+        self.shutdown_timeout = None;
+        self
+    }
+
+    pub fn with_stdin_consumer(mut self, consumer: impl Fn(String) + Send + 'static) -> Self {
+        self.stdin_consumer = Some(Box::new(consumer));
+        self
+    }
+
+    pub fn without_stdin_consumer(mut self) -> Self {
+        self.stdin_consumer = None;
         self
     }
 
@@ -269,6 +314,50 @@ impl RootBuilder {
         } else {
             error!("Failed to register SIGTERM handler");
         }
+    }
+
+    fn register_stdin_handler<F>(
+        &self,
+        global: &CancellationToken,
+        crash: CrashHolder,
+        shutdown_on_stdin_close: bool,
+        consumer: Option<F>,
+    ) where
+        F: Fn(String) + Send + 'static,
+    {
+        let global = global.clone();
+        thread::spawn(move || gobble_stdin(global, crash, shutdown_on_stdin_close, consumer));
+    }
+}
+
+fn gobble_stdin<F: Fn(String)>(
+    global: CancellationToken,
+    crash: CrashHolder,
+    shutdown_on_stdin_close: bool,
+    consumer: Option<F>,
+) {
+    for line in stdin().lines() {
+        match line {
+            Ok(line) => {
+                if let Some(consumer) = &consumer {
+                    consumer(line);
+                }
+            }
+            Err(e) => {
+                warn!("Stdin closed abnormally: {e}");
+
+                if shutdown_on_stdin_close {
+                    info!("Initiating shutdown.");
+                    crash.set_exit_code(ExitCode::from(1));
+                    global.cancel();
+                }
+                return;
+            }
+        }
+    }
+    if shutdown_on_stdin_close {
+        info!("Stdin closed, initiating shutdown.");
+        global.cancel();
     }
 }
 
@@ -554,5 +643,17 @@ pub fn build_root(name: impl Into<String>) -> RootBuilder {
         name: name.into(),
         catch_signals: false,
         shutdown_timeout: None,
+        shutdown_on_stdin_close: false,
+        stdin_consumer: None,
+    }
+}
+
+pub fn build_default_root(name: impl Into<String>) -> RootBuilder {
+    RootBuilder {
+        name: name.into(),
+        catch_signals: true,
+        shutdown_timeout: Some(Duration::from_secs(1)),
+        shutdown_on_stdin_close: false,
+        stdin_consumer: None,
     }
 }
