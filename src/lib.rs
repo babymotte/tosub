@@ -394,6 +394,8 @@ pub enum SubsystemError {
     Panic(String, String),
     #[error("Subsystem shutdown timed out")]
     ForcedShutdown,
+    #[error("{0}")]
+    Custom(String),
 }
 
 pub trait GenErr: Debug + Display + Send + Sync + 'static {}
