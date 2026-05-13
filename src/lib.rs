@@ -109,7 +109,7 @@ impl RootBuilder {
 
         let stdin_consumer = self.stdin_consumer.take();
         let shutdown_on_stdin_close = self.shutdown_on_stdin_close;
-        if stdin_consumer.is_none() || shutdown_on_stdin_close {
+        if stdin_consumer.is_some() || shutdown_on_stdin_close {
             self.register_stdin_handler(
                 &global,
                 crash.clone(),
