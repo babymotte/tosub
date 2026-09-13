@@ -404,8 +404,30 @@ impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
 
 pub struct GenericError(Box<dyn GenErr>);
 
+impl From<miette::Report> for GenericError {
+    fn from(err: miette::Report) -> Self {
+        GenericError(Box::new(err))
+    }
+}
+
 pub trait IntoGenericError {
     fn into_generic_error(self) -> GenericError;
+}
+
+pub trait IntoSubsystemResult<T> {
+    fn into_subsystem_result(self, message: impl Into<String>) -> Result<T, SubsystemError>;
+}
+
+impl<T, E: IntoGenericError> IntoSubsystemResult<T> for Result<T, E> {
+    fn into_subsystem_result(self, message: impl Into<String>) -> Result<T, SubsystemError> {
+        match self {
+            Ok(it) => Ok(it),
+            Err(e) => Err(SubsystemError::Error(
+                message.into(),
+                e.into_generic_error(),
+            )),
+        }
+    }
 }
 
 impl<E: GenErr> IntoGenericError for E {
