@@ -1,10 +1,10 @@
-use std::io;
-use tosub::{Subsystem, SubsystemResult};
+use std::{io, process::ExitCode};
+use tosub::Subsystem;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> SubsystemResult {
+async fn main() -> miette::Result<ExitCode> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(

@@ -15,7 +15,8 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use miette::{IntoDiagnostic, miette};
+use miette::miette;
+use std::process::ExitCode;
 use std::{io, time::Duration};
 use tokio::select;
 use tokio::time::sleep;
@@ -25,7 +26,7 @@ use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn main() -> miette::Result<ExitCode> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -49,8 +50,6 @@ async fn main() -> miette::Result<()> {
             Ok::<(), miette::Report>(())
         })
         .await
-        .into_diagnostic()?;
-    Ok(())
 }
 
 async fn service_loop(subsys: tosub::Subsystem, duration: Duration) -> miette::Result<()> {

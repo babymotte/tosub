@@ -17,12 +17,11 @@
 
 use std::{io, time::Duration};
 use tokio::time::sleep;
-use tosub::SubsystemResult;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() -> SubsystemResult {
+async fn main() -> miette::Result<()> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -37,15 +36,17 @@ async fn main() -> SubsystemResult {
         .catch_signals()
         .with_timeout(Duration::from_secs(5));
 
-    // tosub lets you recover the exit code matching the signal that stopped the process.
-    // it is for the application developer to decide if on a clean shutdown an exit code of 0 or
-    // the one matching the signal should be returned.
+    // By default, tosub root systems return an exit code matching the reason the process terminated.
+    // In applications that perform an orderly shutdown when receiving a signal, it is however recommended
+    // to return exit code 0 if the shutdown was successful to indicate a clean program exit.
     let exit_code = root.start(run).await?;
+    eprintln!("Exit code: {:?}", exit_code);
 
-    // in this case we try to return the exit code matching the signal, however this line of code will
-    // never be reached since the elapsing shutdown timeout will trigger an error in the previous line,
-    // ending the process with an exit code of 1.
-    Ok(exit_code)
+    // Hence we discardit in this case and just return an empty result
+    // Notice however that this code is never reached anyway since we
+    // run into a timeout and thus do NOT perform an orderly shutdown.
+    // The process will therefore exit with a code 1 anyway.
+    Ok(())
 }
 
 async fn run(root: tosub::Subsystem) -> miette::Result<()> {

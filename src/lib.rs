@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-use miette::Diagnostic;
+use miette::{Diagnostic, IntoDiagnostic};
 use std::{
     collections::HashMap,
     fmt::{self, Debug, Display},
@@ -90,7 +90,7 @@ impl RootBuilder {
     pub async fn start<E, F>(
         mut self,
         subsys: impl FnOnce(Subsystem) -> F + Send + 'static,
-    ) -> SubsystemResult
+    ) -> miette::Result<ExitCode>
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
         E: IntoGenericError + Display,
@@ -207,7 +207,10 @@ impl RootBuilder {
             });
         }
 
-        res_rx.await.unwrap_or(Err(SubsystemError::ForcedShutdown))
+        res_rx
+            .await
+            .unwrap_or(Err(SubsystemError::ForcedShutdown))
+            .into_diagnostic()
     }
 
     pub fn catch_signals(mut self) -> Self {
@@ -395,23 +398,21 @@ fn handle_unix_signal(
 
 #[derive(Debug, Clone, Error, Diagnostic)]
 pub enum SubsystemError {
-    #[error("Subsystem '{0}' terminated with error: {1}")]
-    Error(String, GenericError),
-    #[error("Subsystem '{0}' panicked: {1}")]
-    Panic(String, String),
+    #[error("Subsystem '{0}' terminated with error")]
+    Error(String, #[source] GenericError),
+    #[error("Subsystem '{0}' panicked")]
+    Panic(String, #[source] GenericError),
     #[error("Subsystem did not complete because it was asked to shut down")]
     OrderlyShutdown,
     #[error("Subsystem did not complete because it was forced to shut down")]
     ForcedShutdown,
-    #[error("{0}")]
-    Custom(String),
 }
 
 pub trait GenErr: Debug + Display + Send + Sync + 'static {}
 
 impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
 
-#[derive(Clone)]
+#[derive(Clone, Error, Diagnostic)]
 pub struct GenericError(Arc<dyn GenErr>);
 
 impl From<miette::Report> for GenericError {
@@ -458,13 +459,18 @@ impl fmt::Display for GenericError {
     }
 }
 
-pub type SubsystemResult = Result<ExitCode, SubsystemError>;
+type SubsystemResult = Result<ExitCode, SubsystemError>;
 
 async fn wait_for_subsystems_shutdown(subsystems: HashMap<String, oneshot::Receiver<()>>) {
     for rx in subsystems.into_values() {
         rx.await.ok();
     }
 }
+
+type ResultWatchChannel<T> = (
+    watch::Sender<Option<Result<T, SubsystemError>>>,
+    watch::Receiver<Option<Result<T, SubsystemError>>>,
+);
 
 pub struct Subsystem<T = ()> {
     name: String,
@@ -474,10 +480,7 @@ pub struct Subsystem<T = ()> {
     cancel_clean_local_shutdown: CancellationToken,
     subsystems: SubsystemMap,
     crash: CrashHolder,
-    join_handle: (
-        watch::Sender<Option<Result<T, SubsystemError>>>,
-        watch::Receiver<Option<Result<T, SubsystemError>>>,
-    ),
+    join_handle: ResultWatchChannel<T>,
     shutdown_timeout: Option<Duration>,
 }
 
@@ -675,7 +678,8 @@ impl<T: Clone + Send + Sync + 'static> Subsystem<T> {
             Err(e) => {
                 if e.is_panic() {
                     error!("Subsystem '{}' panicked: {}", subsystem_name, e);
-                    let err = SubsystemError::Panic(subsystem_name.to_owned(), e.to_string());
+                    let err =
+                        SubsystemError::Panic(subsystem_name.to_owned(), e.into_generic_error());
                     crash.set_crash(err.clone());
                     res_tx.send(Some(Err(err))).ok();
                 } else {

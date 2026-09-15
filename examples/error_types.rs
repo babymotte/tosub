@@ -15,8 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use miette::IntoDiagnostic;
-use std::{io, time::Duration};
+use std::{io, process::ExitCode, time::Duration};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -33,7 +32,7 @@ struct Error1(&'static str);
 struct Error2(&'static str);
 
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn main() -> miette::Result<ExitCode> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -49,8 +48,6 @@ async fn main() -> miette::Result<()> {
         .with_timeout(Duration::from_secs(5))
         .start(run)
         .await
-        .into_diagnostic()?;
-    Ok(())
 }
 
 async fn run(root: tosub::Subsystem) -> Result<(), Error0> {

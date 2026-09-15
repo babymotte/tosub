@@ -16,14 +16,14 @@
  */
 
 use miette::IntoDiagnostic;
-use std::{io, time::Duration};
+use std::{io, process::ExitCode, time::Duration};
 use tokio::runtime::Handle;
 use tosub::Subsystem;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> miette::Result<()> {
+async fn main() -> miette::Result<ExitCode> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -40,12 +40,11 @@ async fn main() -> miette::Result<()> {
         .catch_signals()
         .with_timeout(Duration::from_secs(1))
         .start(run)
-        .await
-        .into_diagnostic()?;
+        .await?;
 
     info!("Root runtime completed.");
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run(root: Subsystem) -> miette::Result<()> {

@@ -1,18 +1,20 @@
 use axum::{Router, response::Html, routing::get};
 use miette::{Context, IntoDiagnostic};
 use std::time::Duration;
-use tosub::{Subsystem, SubsystemResult};
+use tosub::Subsystem;
 use tracing::info;
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> SubsystemResult {
+async fn main() -> miette::Result<()> {
     tracing_subscriber::fmt::init();
 
     tosub::build_root("simple_axum_node_api")
         .catch_signals()
         .with_timeout(Duration::from_secs(1))
         .start(run)
-        .await
+        .await?;
+
+    Ok(())
 }
 
 async fn run(subsys: Subsystem) -> miette::Result<()> {
@@ -31,9 +33,7 @@ async fn run(subsys: Subsystem) -> miette::Result<()> {
         .with_graceful_shutdown(subsys.into_shutdown_requested())
         .await
         .into_diagnostic()
-        .wrap_err("failed to start axum server")?;
-
-    Ok(())
+        .wrap_err("failed to start axum server")
 }
 
 async fn handler() -> Html<&'static str> {

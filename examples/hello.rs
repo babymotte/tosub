@@ -1,9 +1,8 @@
-use miette::IntoDiagnostic;
-use std::{io, time::Duration};
+use std::{io, process::ExitCode, time::Duration};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
-async fn main() -> miette::Result<()> {
+async fn main() -> miette::Result<ExitCode> {
     tracing_subscriber::registry()
         .with(
             fmt::Layer::new().with_writer(io::stderr).with_filter(
@@ -31,6 +30,4 @@ async fn main() -> miette::Result<()> {
             Ok::<(), miette::Report>(())
         })
         .await
-        .into_diagnostic()?;
-    Ok(())
 }
