@@ -89,7 +89,7 @@ impl CrashHolder {
 impl RootBuilder {
     pub async fn start<E, F>(
         mut self,
-        subsys: impl FnOnce(SubsystemHandle) -> F + Send + 'static,
+        subsys: impl FnOnce(Subsystem) -> F + Send + 'static,
     ) -> SubsystemResult
     where
         F: std::future::Future<Output = Result<(), E>> + Send + 'static,
@@ -125,7 +125,7 @@ impl RootBuilder {
 
         let subsystems = Arc::new(Mutex::new(HashMap::new()));
 
-        let handle = SubsystemHandle {
+        let handle = Subsystem {
             name: self.name.clone(),
             global: global.clone(),
             local: local.clone(),
@@ -461,7 +461,7 @@ async fn wait_for_subsystems_shutdown(subsystems: HashMap<String, oneshot::Recei
     }
 }
 
-pub struct SubsystemHandle<T = ()> {
+pub struct Subsystem<T = ()> {
     name: String,
     local: CancellationToken,
     global: CancellationToken,
@@ -474,9 +474,9 @@ pub struct SubsystemHandle<T = ()> {
     ),
 }
 
-impl<T> Clone for SubsystemHandle<T> {
+impl<T> Clone for Subsystem<T> {
     fn clone(&self) -> Self {
-        SubsystemHandle {
+        Subsystem {
             name: self.name.clone(),
             local: self.local.clone(),
             global: self.global.clone(),
@@ -488,7 +488,7 @@ impl<T> Clone for SubsystemHandle<T> {
     }
 }
 
-impl<T> fmt::Debug for SubsystemHandle<T> {
+impl<T> fmt::Debug for Subsystem<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SubsystemHandle")
             .field("name", &self.name)
@@ -506,7 +506,7 @@ where
     }
 }
 
-impl<T: Clone + Send> SubsystemHandle<T> {
+impl<T: Clone + Send> Subsystem<T> {
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -514,8 +514,8 @@ impl<T: Clone + Send> SubsystemHandle<T> {
     pub fn spawn<ChildT, Err, F>(
         &self,
         name: impl AsRef<str>,
-        subsys: impl FnOnce(SubsystemHandle<ChildT>) -> F + Send + 'static,
-    ) -> SubsystemHandle<ChildT>
+        subsys: impl FnOnce(Subsystem<ChildT>) -> F + Send + 'static,
+    ) -> Subsystem<ChildT>
     where
         ChildT: Clone + Send + Sync + 'static,
         F: Future<Output = Result<ChildT, Err>> + Send + 'static,
@@ -586,7 +586,7 @@ impl<T: Clone + Send> SubsystemHandle<T> {
         &self,
         name: impl AsRef<str>,
         cancel_clean_shutdown: CancellationToken,
-    ) -> SubsystemHandle<ChildT> {
+    ) -> Subsystem<ChildT> {
         let (res_tx, res_rx) = watch::channel::<Option<Result<ChildT, SubsystemError>>>(None);
         let name = format!("{}/{}", self.name, name.as_ref());
         let global = self.global.clone();
@@ -603,7 +603,7 @@ impl<T: Clone + Send> SubsystemHandle<T> {
         });
         gc.insert(name.clone(), gc_rx);
 
-        SubsystemHandle {
+        Subsystem {
             name,
             global,
             local,

@@ -19,7 +19,7 @@ use miette::{IntoDiagnostic, miette};
 use std::{io, time::Duration};
 use tokio::select;
 use tokio::time::sleep;
-use tosub::SubsystemHandle;
+use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -53,7 +53,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> miette::Result<()> {
+async fn service_loop(subsys: tosub::Subsystem, duration: Duration) -> miette::Result<()> {
     info!("Service {} started.", subsys.name());
 
     loop {
@@ -72,7 +72,7 @@ async fn service_loop(subsys: tosub::SubsystemHandle, duration: Duration) -> mie
     Ok(())
 }
 
-async fn service_runner(s: SubsystemHandle, duration: Duration) -> miette::Result<()> {
+async fn service_runner(s: Subsystem, duration: Duration) -> miette::Result<()> {
     info!("Service {} started.\n", s.name());
 
     let simulated_work = async {

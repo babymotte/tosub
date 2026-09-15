@@ -1,7 +1,7 @@
 use axum::{Router, response::Html, routing::get};
 use miette::{Context, IntoDiagnostic};
 use std::time::Duration;
-use tosub::{SubsystemHandle, SubsystemResult};
+use tosub::{Subsystem, SubsystemResult};
 use tracing::info;
 
 #[tokio::main(flavor = "current_thread")]
@@ -15,7 +15,7 @@ async fn main() -> SubsystemResult {
         .await
 }
 
-async fn run(subsys: SubsystemHandle) -> miette::Result<()> {
+async fn run(subsys: Subsystem) -> miette::Result<()> {
     info!("building router …");
     let app = Router::new().route("/", get(handler));
 

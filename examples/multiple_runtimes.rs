@@ -18,7 +18,7 @@
 use miette::IntoDiagnostic;
 use std::{io, time::Duration};
 use tokio::runtime::Handle;
-use tosub::SubsystemHandle;
+use tosub::Subsystem;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -48,7 +48,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn run(root: SubsystemHandle) -> miette::Result<()> {
+async fn run(root: Subsystem) -> miette::Result<()> {
     root.spawn("1", run_subsys);
     root.spawn("2", run_subsys);
     root.spawn("3", run_subsys);
@@ -56,14 +56,14 @@ async fn run(root: SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn run_subsys(subsys: SubsystemHandle) -> miette::Result<()> {
+async fn run_subsys(subsys: Subsystem) -> miette::Result<()> {
     let s = subsys.clone();
     Handle::current().spawn_blocking(move || run_subsys_on_other_runtime(s));
     subsys.shutdown_requested().await;
     Ok(())
 }
 
-fn run_subsys_on_other_runtime(s: SubsystemHandle) -> Result<(), miette::Error> {
+fn run_subsys_on_other_runtime(s: Subsystem) -> Result<(), miette::Error> {
     info!("Creating new runtime for subsystem '{}'", s.name());
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -74,7 +74,7 @@ fn run_subsys_on_other_runtime(s: SubsystemHandle) -> Result<(), miette::Error> 
     Ok(())
 }
 
-async fn do_something_on_other_runtime(subsys: SubsystemHandle) {
+async fn do_something_on_other_runtime(subsys: Subsystem) {
     info!(
         "Hello from subsystem '{}' on runtime '{}'",
         subsys.name(),

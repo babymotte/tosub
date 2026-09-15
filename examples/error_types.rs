@@ -53,7 +53,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn run(root: tosub::SubsystemHandle) -> Result<(), Error0> {
+async fn run(root: tosub::Subsystem) -> Result<(), Error0> {
     root.spawn("child 1", |_| async { Err::<(), Error1>(Error1("some")) });
 
     root.spawn("child 2", |_| async { Err::<(), Error2>(Error2("thing")) });

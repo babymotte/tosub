@@ -17,7 +17,7 @@
 
 use std::{io, time::Duration};
 use tokio::{select, time::sleep};
-use tosub::SubsystemHandle;
+use tosub::Subsystem;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -42,7 +42,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn run(subsys: SubsystemHandle) -> miette::Result<()> {
+async fn run(subsys: Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsys.name());
 
     select! {

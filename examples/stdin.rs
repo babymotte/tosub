@@ -1,7 +1,7 @@
 use miette::IntoDiagnostic;
 use std::{io, thread};
 use tokio::{select, sync::mpsc};
-use tosub::SubsystemHandle;
+use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
@@ -23,7 +23,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn run(subsys: SubsystemHandle) -> miette::Result<()> {
+async fn run(subsys: Subsystem) -> miette::Result<()> {
     let (tx, mut rx) = mpsc::channel(100);
 
     thread::spawn(move || {

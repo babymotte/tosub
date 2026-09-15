@@ -71,7 +71,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn child1(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child1(subsys: tosub::Subsystem) -> miette::Result<()> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(1)) => info!("Child 1 completed work"),
@@ -80,7 +80,7 @@ async fn child1(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn child2(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child2(subsys: tosub::Subsystem) -> miette::Result<()> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(2)) => info!("Child 2 completed work"),
@@ -89,7 +89,7 @@ async fn child2(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
     Err(miette::miette!("Child 2 encountered an error"))
 }
 
-async fn child3(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child3(subsys: tosub::Subsystem) -> miette::Result<()> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(3)) => info!("Child 3 completed work"),

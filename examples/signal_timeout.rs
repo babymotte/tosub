@@ -48,7 +48,7 @@ async fn main() -> SubsystemResult {
     Ok(exit_code)
 }
 
-async fn run(root: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn run(root: tosub::Subsystem) -> miette::Result<()> {
     root.spawn("child 1", child1);
     root.spawn("child 2", child2);
     root.spawn("child 3", child3);
@@ -58,7 +58,7 @@ async fn run(root: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn child1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child1(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.spawn("grandchild 1", grandchild1);
@@ -72,7 +72,7 @@ async fn child1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn grandchild2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn grandchild2(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.spawn("great grandchild 1", great_grandchild1);
@@ -85,7 +85,7 @@ async fn grandchild2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn great_grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn great_grandchild1(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.shutdown_requested().await;
@@ -96,7 +96,7 @@ async fn great_grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<
     Ok(())
 }
 
-async fn grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn grandchild1(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.shutdown_requested().await;
@@ -106,7 +106,7 @@ async fn grandchild1(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn child2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child2(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.spawn("grandchild 3", grandchild3);
@@ -119,7 +119,7 @@ async fn child2(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn grandchild3(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn grandchild3(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.shutdown_requested().await;
@@ -130,7 +130,7 @@ async fn grandchild3(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
     Ok(())
 }
 
-async fn child3(subsystem: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child3(subsystem: tosub::Subsystem) -> miette::Result<()> {
     println!("Hello from {}", subsystem.name());
 
     subsystem.shutdown_requested().await;

@@ -1,5 +1,5 @@
 use std::io;
-use tosub::{SubsystemHandle, SubsystemResult};
+use tosub::{Subsystem, SubsystemResult};
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -22,7 +22,7 @@ async fn main() -> SubsystemResult {
         .await
 }
 
-async fn run(subsys: SubsystemHandle) -> miette::Result<()> {
+async fn run(subsys: Subsystem) -> miette::Result<()> {
     info!("Hello, World! You can exit the app by pressing Ctrl+C or Ctrl+D (closing stdin).");
 
     subsys.shutdown_requested().await;

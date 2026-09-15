@@ -19,7 +19,7 @@ use miette::IntoDiagnostic;
 use miette::miette;
 use std::{io, time::Duration};
 use tokio::time::sleep;
-use tosub::SubsystemHandle;
+use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -39,7 +39,7 @@ async fn main() -> miette::Result<()> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
-            root.spawn("child 1", |subsystem: SubsystemHandle<()>| async move {
+            root.spawn("child 1", |subsystem: Subsystem<()>| async move {
                 println!("Hello from {}", subsystem.name());
                 sleep(Duration::from_secs(1)).await;
                 Err(miette!("Oopsie whoopsie!"))

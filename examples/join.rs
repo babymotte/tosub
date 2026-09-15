@@ -74,7 +74,7 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn child1(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+async fn child1(subsys: tosub::Subsystem<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(1)) => {
@@ -85,7 +85,7 @@ async fn child1(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     }
 }
 
-async fn child2(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+async fn child2(subsys: tosub::Subsystem<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(2)) => {
@@ -96,7 +96,7 @@ async fn child2(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     }
 }
 
-async fn child3(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+async fn child3(subsys: tosub::Subsystem<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = sleep(Duration::from_secs(3)) => {
@@ -107,7 +107,7 @@ async fn child3(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     }
 }
 
-async fn child4(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+async fn child4(subsys: tosub::Subsystem<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
         _ = pending() => (),
@@ -116,7 +116,7 @@ async fn child4(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     Ok(4)
 }
 
-async fn child5(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+async fn child5(subsys: tosub::Subsystem<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     pending().await
 }
