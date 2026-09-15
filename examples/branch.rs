@@ -41,14 +41,15 @@ async fn main() -> miette::Result<()> {
                     Ok::<(), miette::Report>(())
                 });
 
-                tick.join().await;
-                tock.join().await;
+                tick.join().await.ok();
+                tock.join().await.ok();
                 s.request_global_shutdown();
 
                 Ok::<(), miette::Report>(())
             })
             .join()
-            .await;
+            .await
+            .ok();
 
             Ok::<(), miette::Report>(())
         })
