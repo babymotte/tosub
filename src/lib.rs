@@ -121,7 +121,8 @@ impl RootBuilder {
         let (res_tx, res_rx) = oneshot::channel();
         let (join_tx, join_rx) = watch::channel(None);
 
-        let cancel_clean_shutdown = CancellationToken::new();
+        let cancel_clean_global_shutdown = CancellationToken::new();
+        let cancel_clean_local_shutdown = CancellationToken::new();
 
         let subsystems = Arc::new(Mutex::new(HashMap::new()));
 
@@ -129,10 +130,12 @@ impl RootBuilder {
             name: self.name.clone(),
             global: global.clone(),
             local: local.clone(),
-            cancel_clean_shutdown: cancel_clean_shutdown.clone(),
+            cancel_clean_global_shutdown: cancel_clean_global_shutdown.clone(),
+            cancel_clean_local_shutdown,
             subsystems: subsystems.clone(),
             crash: crash.clone(),
             join_handle: (join_tx.clone(), join_rx),
+            shutdown_timeout: self.shutdown_timeout,
         };
 
         let glob = global.clone();
@@ -166,8 +169,10 @@ impl RootBuilder {
                         info!("All subsystems have shut down in time.");
                     }
                     Err(_) => {
-                        error!("Shutdown timeout reached, forcing shutdown …");
-                        cancel_clean_shutdown.cancel();
+                        error!(
+                            "Global shutdown timeout reached, forcing shutdown of remaining subsystems …"
+                        );
+                        cancel_clean_global_shutdown.cancel();
                         crash.set_crash(SubsystemError::ForcedShutdown);
                     }
                 }
@@ -465,13 +470,15 @@ pub struct Subsystem<T = ()> {
     name: String,
     local: CancellationToken,
     global: CancellationToken,
-    cancel_clean_shutdown: CancellationToken,
+    cancel_clean_global_shutdown: CancellationToken,
+    cancel_clean_local_shutdown: CancellationToken,
     subsystems: SubsystemMap,
     crash: CrashHolder,
     join_handle: (
         watch::Sender<Option<Result<T, SubsystemError>>>,
         watch::Receiver<Option<Result<T, SubsystemError>>>,
     ),
+    shutdown_timeout: Option<Duration>,
 }
 
 impl<T> Clone for Subsystem<T> {
@@ -480,10 +487,12 @@ impl<T> Clone for Subsystem<T> {
             name: self.name.clone(),
             local: self.local.clone(),
             global: self.global.clone(),
-            cancel_clean_shutdown: self.cancel_clean_shutdown.clone(),
+            cancel_clean_global_shutdown: self.cancel_clean_global_shutdown.clone(),
+            cancel_clean_local_shutdown: self.cancel_clean_local_shutdown.clone(),
             subsystems: self.subsystems.clone(),
             crash: self.crash.clone(),
             join_handle: (self.join_handle.0.clone(), self.join_handle.1.clone()),
+            shutdown_timeout: self.shutdown_timeout,
         }
     }
 }
@@ -506,7 +515,7 @@ where
     }
 }
 
-impl<T: Clone + Send> Subsystem<T> {
+impl<T: Clone + Send + Sync + 'static> Subsystem<T> {
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -521,9 +530,14 @@ impl<T: Clone + Send> Subsystem<T> {
         F: Future<Output = Result<ChildT, Err>> + Send + 'static,
         Err: IntoGenericError,
     {
-        let cancel_clean_shutdown = self.cancel_clean_shutdown.clone();
+        let cancel_clean_global_shutdown = self.cancel_clean_global_shutdown.clone();
+        let cancel_clean_local_shutdown = CancellationToken::new();
 
-        let handle = self.create_child(name, cancel_clean_shutdown.clone());
+        let handle = self.create_child(
+            name,
+            cancel_clean_global_shutdown.clone(),
+            cancel_clean_local_shutdown.clone(),
+        );
         let full_name = handle.name().to_owned();
 
         let fname = full_name.clone();
@@ -542,7 +556,8 @@ impl<T: Clone + Send> Subsystem<T> {
             });
             select! {
                 res = &mut join_handle => Self::subsystem_joined(res, subsystems, &fname, &mut crash, res_tx).await,
-                _ = cancel_clean_shutdown.cancelled() => Self::shutdown_timed_out(join_handle, &fname, &glob, &mut crash).await,
+                _ = cancel_clean_global_shutdown.cancelled() => Self::global_shutdown_timed_out(join_handle, &fname, &glob, &mut crash).await,
+                _ = cancel_clean_local_shutdown.cancelled() => Self::subsystem_timed_out(join_handle, subsystems, &fname, res_tx).await,
             };
         });
 
@@ -550,11 +565,21 @@ impl<T: Clone + Send> Subsystem<T> {
     }
 
     pub fn request_global_shutdown(&self) {
+        info!("Global shutdown requested from subsystem '{}'", self.name);
         self.global.cancel();
     }
 
     pub fn request_local_shutdown(&self) {
+        info!("Local shutdown requested for subsystem '{}'", self.name);
         self.local.cancel();
+        if let Some(shutdown_timeout) = self.shutdown_timeout {
+            spawn(local_shutdown_timeout(
+                self.join_handle.1.clone(),
+                self.name.clone(),
+                self.cancel_clean_local_shutdown.clone(),
+                shutdown_timeout,
+            ));
+        }
     }
 
     pub async fn shutdown_requested(&self) {
@@ -585,7 +610,8 @@ impl<T: Clone + Send> Subsystem<T> {
     fn create_child<ChildT: Send + Sync + 'static>(
         &self,
         name: impl AsRef<str>,
-        cancel_clean_shutdown: CancellationToken,
+        cancel_clean_global_shutdown: CancellationToken,
+        cancel_clean_local_shutdown: CancellationToken,
     ) -> Subsystem<ChildT> {
         let (res_tx, res_rx) = watch::channel::<Option<Result<ChildT, SubsystemError>>>(None);
         let name = format!("{}/{}", self.name, name.as_ref());
@@ -607,10 +633,12 @@ impl<T: Clone + Send> Subsystem<T> {
             name,
             global,
             local,
-            cancel_clean_shutdown,
+            cancel_clean_global_shutdown,
+            cancel_clean_local_shutdown,
             subsystems,
             crash,
             join_handle: (res_tx, res_rx),
+            shutdown_timeout: self.shutdown_timeout,
         }
     }
 
@@ -660,7 +688,30 @@ impl<T: Clone + Send> Subsystem<T> {
         };
     }
 
-    async fn shutdown_timed_out<ChildT, Err>(
+    async fn subsystem_timed_out<ChildT: Clone + Send + Sync, Err>(
+        join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
+        subsystems: SubsystemMap,
+        subsystem_name: &str,
+        res_tx: watch::Sender<Option<Result<ChildT, SubsystemError>>>,
+    ) where
+        Err: Debug + Display + Send + Sync + 'static,
+    {
+        Self::local_shutdown_timed_out(join_handle, subsystem_name).await;
+
+        let mut gc = subsystems.lock().expect("mutex is poisoned");
+        gc.remove(subsystem_name);
+
+        debug!(
+            "Subsystem '{}' removed. Remaining subsystems: {:?}",
+            subsystem_name,
+            gc.keys()
+        );
+
+        warn!("Subsystem '{}' was shut down forcefully.", subsystem_name);
+        res_tx.send(Some(Err(SubsystemError::ForcedShutdown))).ok();
+    }
+
+    async fn global_shutdown_timed_out<ChildT, Err>(
         join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
         subsystem_name: &str,
         global: &CancellationToken,
@@ -675,6 +726,36 @@ impl<T: Clone + Send> Subsystem<T> {
         join_handle.abort();
         global.cancel();
         crash.set_crash(SubsystemError::ForcedShutdown);
+    }
+
+    async fn local_shutdown_timed_out<ChildT, Err>(
+        join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
+        subsystem_name: &str,
+    ) where
+        Err: Debug + Display + Send + Sync + 'static,
+    {
+        warn!(
+            "Subsystem '{}' is being shut down forcefully.",
+            subsystem_name
+        );
+        join_handle.abort();
+    }
+}
+
+async fn local_shutdown_timeout<T>(
+    mut join_handle: watch::Receiver<Option<Result<T, SubsystemError>>>,
+    name: String,
+    cancel_clean_shutdown: CancellationToken,
+    shutdown_timeout: Duration,
+) {
+    let complete = join_handle.wait_for(|it| it.is_some());
+    let timed_out = timeout(shutdown_timeout, complete).await.is_err();
+    if timed_out {
+        error!(
+            "Local shutdown timeout of subsystem '{}' reached, forcing shutdown …",
+            name
+        );
+        cancel_clean_shutdown.cancel();
     }
 }
 
