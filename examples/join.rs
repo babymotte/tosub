@@ -16,7 +16,7 @@
  */
 
 use miette::IntoDiagnostic;
-use std::{io, time::Duration};
+use std::{future::pending, io, time::Duration};
 use tokio::select;
 use tokio::time::sleep;
 use tracing::info;
@@ -37,20 +37,35 @@ async fn main() -> miette::Result<()> {
 
     tosub::build_root("hello_world")
         .catch_signals()
-        .with_timeout(Duration::from_secs(5))
+        .with_timeout(Duration::from_secs(4))
         .start(|root| async move {
             let child1 = root.spawn("child 1", child1);
             let child2 = root.spawn("child 2", child2);
             let child3 = root.spawn("child 3", child3);
+            let child4 = root.spawn("child 4", child4);
+            let child5 = root.spawn("child 5", child5);
 
-            child3.join().await;
-            info!("Child 3 done");
+            // this will shut down the subsystem, however it will keep running because it does not handle the shutdown request gracefully and it will eventually be killed forcefully
+            child5.request_local_shutdown();
+            let res = child5.join().await;
+            info!("Child 5 done with result: {:?}", res);
 
-            child2.join().await;
-            info!("Child 2 done");
+            // this will shut down the subsystem, however it will still return an ok result because it gracefully handles the shutdown request
+            child4.request_local_shutdown();
+            let res = child4.join().await;
+            info!("Child 4 done with result: {:?}", res);
 
-            child1.join().await;
-            info!("Child 1 done");
+            // the remaining systems will complete normally and will not be requested to shut down
+
+            child3.request_local_shutdown();
+            let res = child3.join().await;
+            info!("Child 3 done with result: {:?}", res);
+
+            let res = child2.join().await;
+            info!("Child 2 done with result: {:?}", res);
+
+            let res = child1.join().await;
+            info!("Child 1 done with result: {:?}", res);
 
             Ok::<(), miette::Report>(())
         })
@@ -59,29 +74,49 @@ async fn main() -> miette::Result<()> {
     Ok(())
 }
 
-async fn child1(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child1(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
-        _ = sleep(Duration::from_secs(1)) => info!("Child 1 completed work"),
-        _ = subsys.shutdown_requested() => info!("Child 1 received shutdown request"),
+        _ = sleep(Duration::from_secs(1)) => {
+            info!("Child 1 completed work");
+            Ok(1)
+        },
+        _ = subsys.shutdown_requested() => Err(miette::miette!("Child 1 received shutdown request")),
     }
-    Ok(())
 }
 
-async fn child2(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child2(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
-        _ = sleep(Duration::from_secs(2)) => info!("Child 2 completed work"),
-        _ = subsys.shutdown_requested() => info!("Child 2 received shutdown request"),
+        _ = sleep(Duration::from_secs(2)) => {
+            info!("Child 2 completed work");
+            Ok(2)
+        },
+        _ = subsys.shutdown_requested() => Err(miette::miette!("Child 2 received shutdown request")),
     }
-    Ok(())
 }
 
-async fn child3(subsys: tosub::SubsystemHandle) -> miette::Result<()> {
+async fn child3(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
     info!("Hello from {}", subsys.name());
     select! {
-        _ = sleep(Duration::from_secs(3)) => info!("Child 3 completed work"),
-        _ = subsys.shutdown_requested() => info!("Child 3 received shutdown request"),
+        _ = sleep(Duration::from_secs(3)) => {
+            info!("Child 3 completed work");
+            Ok(3)
+        },
+        _ = subsys.shutdown_requested() => Err(miette::miette!("Child 3 received shutdown request")),
     }
-    Ok(())
+}
+
+async fn child4(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+    info!("Hello from {}", subsys.name());
+    select! {
+        _ = pending() => (),
+        _ = subsys.shutdown_requested() => info!("Child 4 received shutdown request"),
+    }
+    Ok(4)
+}
+
+async fn child5(subsys: tosub::SubsystemHandle<u64>) -> miette::Result<u64> {
+    info!("Hello from {}", subsys.name());
+    pending().await
 }
