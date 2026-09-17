@@ -307,7 +307,7 @@ impl RootBuilder {
                 // collect terminaion signals of remaining subsystems and wait for them to trigger
                 let subsystems = {
                     let mut subsystems = subsystems.lock().expect("mutex is poisoned");
-                    std::mem::replace(&mut *subsystems, BTreeMap::new())
+                    std::mem::take(&mut *subsystems)
                 };
                 let subsys_shutdown_future = wait_for_subsystems_shutdown(subsystems);
 
@@ -1182,15 +1182,10 @@ pub trait CancelOnShutdown {
 impl<F: Future> CancelOnShutdown for F {
     type Output = F::Output;
 
-    fn or_cancel_on_shutdown<T>(
-        self,
-        subsystem: &Subsystem<T>,
-    ) -> impl Future<Output = Option<Self::Output>> {
-        async move {
-            select! {
-                _ = subsystem.shutdown_requested() => None,
-                output = self => Some(output),
-            }
+    async fn or_cancel_on_shutdown<T>(self, subsystem: &Subsystem<T>) -> Option<Self::Output> {
+        select! {
+            _ = subsystem.shutdown_requested() => None,
+            output = self => Some(output),
         }
     }
 }
