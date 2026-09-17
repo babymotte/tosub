@@ -48,7 +48,6 @@ async fn main() -> miette::Result<ExitCode> {
                 });
 
                 subsystem.shutdown_requested().await;
-                Ok::<(), miette::ErrReport>(())
             });
 
             sleep(Duration::from_secs(1)).await;

@@ -15,12 +15,19 @@ tokio = { version = "1.53.1", features = ["rt", "time", "signal", "macros"] }
 tracing = "0.1.44"
 miette = "7.6.0"
 thiserror = "2.0.20"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[features]
+default = []
+tokio_unstable = ["tokio/tracing"]
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 miette = { version = "7.6.0", features = ["fancy"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 axum = "0.8.9"
+totils = { version = "1.1.0", features = ["trace_collector"] }
 
 [lints.rust]
 unsafe_code = "forbid"

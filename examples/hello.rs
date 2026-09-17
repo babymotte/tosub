@@ -1,4 +1,5 @@
 use std::{io, process::ExitCode, time::Duration};
+use tosub::Subsystem;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 #[tokio::main]
@@ -17,17 +18,15 @@ async fn main() -> miette::Result<ExitCode> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
-            root.spawn("tick", |s| async move {
+            root.spawn("tick", |s: Subsystem<()>| async move {
                 for i in 0..10 {
                     println!("tick {i}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 s.request_global_shutdown();
-                Ok::<(), miette::Report>(())
             });
 
             root.shutdown_requested().await;
-            Ok::<(), miette::Report>(())
         })
         .await
 }
