@@ -872,6 +872,7 @@ impl<T> Subsystem<T> {
                 trace!(metrics_event = %event);
 
                 select! {
+                    biased;
                     res = &mut join_handle => Self::subsystem_joined(res, subsystems, subsystem_id_2, &mut crash, res_tx).await,
                     _ = cancel_clean_global_shutdown.cancelled() => Self::global_shutdown_timed_out(join_handle, subsystem_id_2, &glob, &mut crash).await,
                     _ = cancel_clean_local_shutdown.cancelled() => Self::subsystem_timed_out(join_handle, subsystems, subsystem_id_2, res_tx).await,
@@ -1184,6 +1185,7 @@ impl<F: Future> CancelOnShutdown for F {
 
     async fn or_cancel_on_shutdown<T>(self, subsystem: &Subsystem<T>) -> Option<Self::Output> {
         select! {
+            biased;
             _ = subsystem.shutdown_requested() => None,
             output = self => Some(output),
         }
