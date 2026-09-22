@@ -21,13 +21,18 @@ async fn run(subsys: Subsystem) -> miette::Result<()> {
     info!("building router …");
     let app = Router::new().route("/", get(handler));
 
+    let bind_addr = "127.0.0.1";
+    let port = 3000;
+
+    let addr = format!("{bind_addr}:{port}");
+
     info!("creating socket …");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .into_diagnostic()
         .wrap_err("failed to bind to 127.0.0.1:3000")?;
 
-    info!("Hello Worl endpoint running at http://127.0.0.1:3000");
+    info!("Hello World endpoint running at {addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(subsys.into_shutdown_requested())

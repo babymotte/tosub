@@ -22,7 +22,9 @@ use miette::{Diagnostic, IntoDiagnostic};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
+    any::Any,
     collections::BTreeMap,
+    convert::Infallible,
     fmt::{self, Debug, Display},
     io::stdin,
     mem,
@@ -50,6 +52,7 @@ use tracing::{error, info, trace, warn};
 pub struct SubsystemId {
     name: String,
     task_id: u64,
+    parent: Option<Box<SubsystemId>>,
 }
 
 impl PartialOrd for SubsystemId {
@@ -67,18 +70,57 @@ impl Ord for SubsystemId {
 }
 
 impl SubsystemId {
-    fn unassigned(name: String) -> Self {
-        SubsystemId { name, task_id: 0 }
+    fn unassigned_root(name: String) -> Self {
+        SubsystemId {
+            name,
+            task_id: 0,
+            parent: None,
+        }
+    }
+
+    fn unassigned_child(&self, name: String) -> Self {
+        SubsystemId {
+            name,
+            task_id: 0,
+            parent: Some(Box::new(self.clone())),
+        }
     }
 
     fn set_task_id(&mut self, task_id: u64) {
         self.task_id = task_id;
     }
+
+    fn path(&self) -> String {
+        let mut path = self.path_iter().collect::<Vec<_>>();
+        path.reverse();
+        path.join("/")
+    }
+
+    fn path_iter<'a>(&'a self) -> IdPathIter<'a> {
+        IdPathIter(Some(self))
+    }
 }
 
-impl Display for SubsystemId {
+struct IdPathIter<'a>(Option<&'a SubsystemId>);
+
+impl<'a> Iterator for IdPathIter<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.0 {
+            Some(it) => {
+                let name = it.name.as_str();
+                self.0 = it.parent.as_deref();
+                Some(name)
+            }
+            None => None,
+        }
+    }
+}
+
+impl fmt::Display for SubsystemId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}-{}", self.task_id, self.name)
+        write!(f, "{}", self.path())
     }
 }
 
@@ -110,7 +152,7 @@ pub enum MetricsEvent {
     },
 }
 
-impl Display for MetricsEvent {
+impl fmt::Display for MetricsEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", json!(self))
     }
@@ -152,7 +194,7 @@ pub struct RootBuilder {
 }
 
 struct CrashHolder {
-    crash: Arc<Mutex<SubsystemResult>>,
+    crash: Arc<Mutex<RootSystemResult>>,
     cancel: CancellationToken,
 }
 
@@ -174,7 +216,7 @@ impl CrashHolder {
         }
     }
 
-    fn set_crash(&self, err: SubsystemError) {
+    fn set_crash(&self, err: RootSystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         if guard.is_ok() {
             *guard = Err(err);
@@ -182,7 +224,7 @@ impl CrashHolder {
         }
     }
 
-    fn take_crash(&self) -> SubsystemResult {
+    fn take_crash(&self) -> RootSystemResult {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         mem::replace(&mut *guard, Ok(ExitCode::SUCCESS))
     }
@@ -207,37 +249,23 @@ impl IntoExitCode for () {
 pub trait IntoExitCodeResult {
     type Output: IntoExitCode;
     type E: IntoGenericError;
-    fn into_exit_code_result(self) -> Result<Self::Output, Self::E>;
-}
-
-pub struct Infallible;
-
-impl Display for Infallible {
-    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        unreachable!()
-    }
-}
-
-impl IntoGenericError for Infallible {
-    fn into_generic_error(self) -> GenericError {
-        unreachable!()
-    }
+    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E>;
 }
 
 impl<C: IntoExitCode> IntoExitCodeResult for C {
     type Output = C;
     type E = Infallible;
 
-    fn into_exit_code_result(self) -> Result<Self::Output, Self::E> {
+    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E> {
         Ok(self)
     }
 }
 
-impl<E: IntoGenericError> IntoExitCodeResult for Result<(), E> {
+impl<E: IntoGenericError> IntoExitCodeResult for std::result::Result<(), E> {
     type Output = ExitCode;
     type E = E;
 
-    fn into_exit_code_result(self) -> Result<Self::Output, Self::E> {
+    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E> {
         match self {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(err) => Err(err),
@@ -247,9 +275,20 @@ impl<E: IntoGenericError> IntoExitCodeResult for Result<(), E> {
 
 impl RootBuilder {
     pub async fn start<R, F>(
-        mut self,
+        self,
         subsys: impl FnOnce(Subsystem) -> F + Send + 'static,
     ) -> miette::Result<ExitCode>
+    where
+        F: std::future::Future<Output = R> + Send + 'static,
+        R: IntoExitCodeResult,
+    {
+        self.start_raw(subsys).await.into_diagnostic()
+    }
+
+    pub async fn start_raw<R, F>(
+        mut self,
+        subsys: impl FnOnce(Subsystem) -> F + Send + 'static,
+    ) -> RootSystemResult
     where
         F: std::future::Future<Output = R> + Send + 'static,
         R: IntoExitCodeResult,
@@ -286,7 +325,7 @@ impl RootBuilder {
         let subsystems = Arc::new(Mutex::new(BTreeMap::new()));
 
         let handle = Subsystem {
-            id: SubsystemId::unassigned(self.name.clone()),
+            id: SubsystemId::unassigned_root(self.name.clone()),
             global: global.clone(),
             local: local.clone(),
             cancel_clean_global_shutdown: cancel_clean_global_shutdown.clone(),
@@ -327,13 +366,15 @@ impl RootBuilder {
                                 "Global shutdown timeout reached, forcing shutdown of remaining subsystems …"
                             );
                             cancel_clean_global_shutdown.cancel();
-                            crash.set_crash(SubsystemError::ForcedShutdown);
+                            crash.set_crash(RootSystemError::ForcedShutdown);
                         }
                     }
 
                     // trigger join handle of root system
                     res_tx.send(crash.take_crash()).ok();
-                    join_tx.send(Some(Err(SubsystemError::ForcedShutdown))).ok();
+                    join_tx
+                        .send(Some(Err(RootSystemError::ForcedShutdown)))
+                        .ok();
                 } else {
                     info!("Shutdown initiated, waiting for clean shutdown.");
 
@@ -343,7 +384,7 @@ impl RootBuilder {
 
                     res_tx.send(crash.take_crash()).ok();
                     join_tx
-                        .send(Some(Err(SubsystemError::OrderlyShutdown)))
+                        .send(Some(Err(RootSystemError::OrderlyShutdown)))
                         .ok();
                 }
             },
@@ -351,10 +392,7 @@ impl RootBuilder {
         );
 
         // block on root system to run and clean up
-        res_rx
-            .await
-            .unwrap_or(Err(SubsystemError::ForcedShutdown))
-            .into_diagnostic()
+        res_rx.await.unwrap_or(Err(RootSystemError::ForcedShutdown))
     }
 
     async fn run_root_system<F, R>(
@@ -411,7 +449,7 @@ impl RootBuilder {
                     outcome: Outcome::TerminatedWithError(generic_error.to_string()),
                 };
                 trace!(metrics_event = %event);
-                crash.set_crash(SubsystemError::Error(id, generic_error));
+                crash.set_crash(RootSystemError::Error(id, generic_error));
             }
         }
 
@@ -622,12 +660,22 @@ fn handle_unix_signal(
     );
 }
 
-#[derive(Debug, Clone, Error, Diagnostic)]
-pub enum SubsystemError {
+#[derive(Clone, Debug, Error, Diagnostic)]
+pub enum RootSystemError {
     #[error("Subsystem '{0}' terminated with error")]
-    Error(SubsystemId, #[source] GenericError),
+    Error(
+        SubsystemId,
+        #[source]
+        #[diagnostic_source]
+        GenericError,
+    ),
     #[error("Subsystem '{0}' panicked")]
-    Panic(SubsystemId, #[source] GenericError),
+    Panic(
+        SubsystemId,
+        #[source]
+        #[diagnostic_source]
+        GenericError,
+    ),
     #[error("Subsystem did not complete because it was asked to shut down")]
     OrderlyShutdown,
     #[error("Subsystem did not complete because it was forced to shut down")]
@@ -638,12 +686,69 @@ pub trait GenErr: Debug + Display + Send + Sync + 'static {}
 
 impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
 
-#[derive(Clone, Error, Diagnostic)]
-pub struct GenericError(Arc<dyn GenErr>);
+#[derive(Clone)]
+enum GenericErrorRepr {
+    Report(Arc<miette::Report>),
+    Opaque(Arc<dyn GenErr>),
+}
+
+#[derive(Clone)]
+pub struct GenericError(GenericErrorRepr);
 
 impl From<miette::Report> for GenericError {
     fn from(err: miette::Report) -> Self {
-        GenericError(Arc::new(err))
+        GenericError(GenericErrorRepr::Report(Arc::new(err)))
+    }
+}
+
+impl GenericError {
+    fn report(&self) -> Option<&miette::Report> {
+        match &self.0 {
+            GenericErrorRepr::Report(report) => Some(report),
+            GenericErrorRepr::Opaque(_) => None,
+        }
+    }
+}
+
+// GenericError is a transparent proxy: its Display already is the wrapped message, so
+// source()/diagnostic_source() continue from the wrapped report's own chain instead of adding a node.
+impl std::error::Error for GenericError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.report().and_then(|r| std::error::Error::source(&**r))
+    }
+}
+
+impl Diagnostic for GenericError {
+    fn code<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
+        self.report().and_then(|r| r.code())
+    }
+
+    fn severity(&self) -> Option<miette::Severity> {
+        self.report().and_then(|r| r.severity())
+    }
+
+    fn help<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
+        self.report().and_then(|r| r.help())
+    }
+
+    fn url<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
+        self.report().and_then(|r| r.url())
+    }
+
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.report().and_then(|r| r.source_code())
+    }
+
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.report().and_then(|r| r.labels())
+    }
+
+    fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
+        self.report().and_then(|r| r.related())
+    }
+
+    fn diagnostic_source(&self) -> Option<&dyn Diagnostic> {
+        self.report().and_then(|r| r.diagnostic_source())
     }
 }
 
@@ -653,16 +758,16 @@ pub trait IntoGenericError {
 
 pub trait IntoGenericResult {
     type Output: Clone + Send + Sync + 'static;
-    fn into_generic_result(self) -> Result<Self::Output, GenericError>;
+    fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError>;
 }
 
-impl<T: Clone + Send + Sync + 'static, Err> IntoGenericResult for Result<T, Err>
+impl<T: Clone + Send + Sync + 'static, Err> IntoGenericResult for std::result::Result<T, Err>
 where
     Err: IntoGenericError,
 {
     type Output = T;
 
-    fn into_generic_result(self) -> Result<Self::Output, GenericError> {
+    fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError> {
         match self {
             Ok(it) => Ok(it),
             Err(e) => Err(e.into_generic_error()),
@@ -673,43 +778,60 @@ where
 impl IntoGenericResult for () {
     type Output = ();
 
-    fn into_generic_result(self) -> Result<Self::Output, GenericError> {
+    fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError> {
         Ok(())
     }
 }
 
-pub trait IntoSubsystemResult<T> {
-    fn into_subsystem_result(self, id: SubsystemId) -> Result<T, SubsystemError>;
+pub trait IntoRootSystemResult<T> {
+    fn into_subsystem_result(self, id: SubsystemId) -> std::result::Result<T, RootSystemError>;
 }
 
-impl<T, E: IntoGenericError> IntoSubsystemResult<T> for Result<T, E> {
-    fn into_subsystem_result(self, id: SubsystemId) -> Result<T, SubsystemError> {
+impl<T, E: IntoGenericError> IntoRootSystemResult<T> for std::result::Result<T, E> {
+    fn into_subsystem_result(self, id: SubsystemId) -> std::result::Result<T, RootSystemError> {
         match self {
             Ok(it) => Ok(it),
-            Err(e) => Err(SubsystemError::Error(id, e.into_generic_error())),
+            Err(e) => Err(RootSystemError::Error(id, e.into_generic_error())),
         }
     }
 }
 
 impl<E: GenErr> IntoGenericError for E {
     fn into_generic_error(self) -> GenericError {
-        GenericError(Arc::new(self))
+        // No specialization available, so detect miette::Report at runtime to keep its cause chain.
+        let mut slot = Some(self);
+        if let Some(report) = (&mut slot as &mut dyn Any)
+            .downcast_mut::<Option<miette::Report>>()
+            .and_then(Option::take)
+        {
+            return report.into();
+        }
+        match slot {
+            Some(err) => GenericError(GenericErrorRepr::Opaque(Arc::new(err))),
+            None => unreachable!("slot is only emptied on the Report path"),
+        }
     }
 }
 
 impl fmt::Debug for GenericError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.0)
+        match &self.0 {
+            GenericErrorRepr::Report(report) => write!(f, "{report:?}"),
+            GenericErrorRepr::Opaque(err) => write!(f, "{err:?}"),
+        }
     }
 }
 
 impl fmt::Display for GenericError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+        match &self.0 {
+            GenericErrorRepr::Report(report) => write!(f, "{report}"),
+            GenericErrorRepr::Opaque(err) => write!(f, "{err}"),
+        }
     }
 }
 
-type SubsystemResult = Result<ExitCode, SubsystemError>;
+pub type RootSystemResult<T = ExitCode> = std::result::Result<T, RootSystemError>;
 
 async fn wait_for_subsystems_shutdown(subsystems: BTreeMap<SubsystemId, oneshot::Receiver<()>>) {
     for rx in subsystems.into_values() {
@@ -717,8 +839,8 @@ async fn wait_for_subsystems_shutdown(subsystems: BTreeMap<SubsystemId, oneshot:
     }
 }
 
-type ResultWatchSender<T> = watch::Sender<Option<Result<T, SubsystemError>>>;
-type ResultWatchReceiver<T> = watch::Receiver<Option<Result<T, SubsystemError>>>;
+type ResultWatchSender<T> = watch::Sender<Option<RootSystemResult<T>>>;
+type ResultWatchReceiver<T> = watch::Receiver<Option<RootSystemResult<T>>>;
 
 type ResultWatchChannel<T> = (ResultWatchSender<T>, ResultWatchReceiver<T>);
 
@@ -815,7 +937,7 @@ impl<T> Subsystem<T> {
 
     pub fn spawn<ChildT>(
         &self,
-        name: impl AsRef<str>,
+        name: impl Into<String>,
         subsys: impl SubsystemFunction<ChildT>,
     ) -> Subsystem<ChildT>
     where
@@ -829,8 +951,7 @@ impl<T> Subsystem<T> {
             cancel_clean_global_shutdown.clone(),
             cancel_clean_local_shutdown.clone(),
         );
-        let full_name = handle.name().to_owned();
-
+        let full_name = handle.id.path();
         let fname = full_name.clone();
         let subsys_task_name = format!("Subsystem: {fname}");
         let cancellation_task_name = format!("Cancellation monitor: {fname}");
@@ -898,12 +1019,13 @@ impl<T> Subsystem<T> {
 
     fn create_child<ChildT: Send + Sync + 'static>(
         &self,
-        name: impl AsRef<str>,
+        name: impl Into<String>,
         cancel_clean_global_shutdown: CancellationToken,
         cancel_clean_local_shutdown: CancellationToken,
     ) -> (Subsystem<ChildT>, oneshot::Receiver<()>) {
-        let (res_tx, res_rx) = watch::channel::<Option<Result<ChildT, SubsystemError>>>(None);
-        let name = format!("{}/{}", self.name(), name.as_ref());
+        let (res_tx, res_rx) =
+            watch::channel::<Option<std::result::Result<ChildT, RootSystemError>>>(None);
+        let name = name.into();
         let global = self.global.clone();
         let local = self.local.child_token();
         let subsystems = self.subsystems.clone();
@@ -912,7 +1034,7 @@ impl<T> Subsystem<T> {
         let (gc_tx, gc_rx) = oneshot::channel();
         let mut gc_res_rx = res_rx.clone();
 
-        let id = SubsystemId::unassigned(name.clone());
+        let id = self.id.unassigned_child(name.clone());
         let id_2 = id.clone();
         let task_name = format!("Join: {name}");
 
@@ -947,7 +1069,7 @@ impl<T> Subsystem<T> {
     }
 
     async fn subsystem_joined<ChildT: Send + Sync>(
-        res: Result<Result<ChildT, GenericError>, JoinError>,
+        res: std::result::Result<std::result::Result<ChildT, GenericError>, JoinError>,
         subsystems: SubsystemMap,
         id: SubsystemId,
         crash: &mut CrashHolder,
@@ -976,7 +1098,7 @@ impl<T> Subsystem<T> {
                     all_running: all_running.clone(),
                 };
                 trace!(metrics_event = %event, "Subsystem '{}' terminated with error: {e}. List of all remaining subsytems: {:#?}", id.name, all_running);
-                let err = SubsystemError::Error(id, e);
+                let err = RootSystemError::Error(id, e);
                 crash.set_crash(err.clone());
                 res_tx.send(Some(Err(err))).ok();
             }
@@ -989,7 +1111,7 @@ impl<T> Subsystem<T> {
                         all_running: all_running.clone(),
                     };
                     trace!(metrics_event = %event, "Subsystem '{}' panicked: {e}. List of all remaining subsytems: {:#?}", id.name, all_running);
-                    let err = SubsystemError::Panic(id, e.into_generic_error());
+                    let err = RootSystemError::Panic(id, miette::Report::from_err(e).into());
                     crash.set_crash(err.clone());
                     res_tx.send(Some(Err(err))).ok();
                 } else {
@@ -1000,7 +1122,7 @@ impl<T> Subsystem<T> {
                         all_running: all_running.clone(),
                     };
                     trace!(metrics_event = %event, "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}", id.name, all_running);
-                    let err = SubsystemError::ForcedShutdown;
+                    let err = RootSystemError::ForcedShutdown;
                     crash.set_crash(err.clone());
                     res_tx.send(Some(Err(err))).ok();
                 }
@@ -1009,10 +1131,10 @@ impl<T> Subsystem<T> {
     }
 
     async fn subsystem_timed_out<ChildT, Err>(
-        join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
+        join_handle: tokio::task::JoinHandle<std::result::Result<ChildT, Err>>,
         subsystems: SubsystemMap,
         id: SubsystemId,
-        res_tx: watch::Sender<Option<Result<ChildT, SubsystemError>>>,
+        res_tx: watch::Sender<Option<std::result::Result<ChildT, RootSystemError>>>,
     ) where
         Err: Debug + Display + Send + Sync + 'static,
     {
@@ -1033,11 +1155,11 @@ impl<T> Subsystem<T> {
         };
         trace!(metrics_event = %event, "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}", id.name, all_running);
 
-        res_tx.send(Some(Err(SubsystemError::ForcedShutdown))).ok();
+        res_tx.send(Some(Err(RootSystemError::ForcedShutdown))).ok();
     }
 
     async fn global_shutdown_timed_out<ChildT, Err>(
-        join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
+        join_handle: tokio::task::JoinHandle<std::result::Result<ChildT, Err>>,
         id: SubsystemId,
         global: &CancellationToken,
         crash: &mut CrashHolder,
@@ -1047,11 +1169,11 @@ impl<T> Subsystem<T> {
         warn!("Subsystem '{}' is being shut down forcefully.", id);
         join_handle.abort();
         global.cancel();
-        crash.set_crash(SubsystemError::ForcedShutdown);
+        crash.set_crash(RootSystemError::ForcedShutdown);
     }
 
     async fn local_shutdown_timed_out<ChildT, Err>(
-        join_handle: tokio::task::JoinHandle<Result<ChildT, Err>>,
+        join_handle: tokio::task::JoinHandle<std::result::Result<ChildT, Err>>,
         id: &SubsystemId,
     ) where
         Err: Debug + Display + Send + Sync + 'static,
@@ -1091,11 +1213,11 @@ impl<T: Send + Sync + 'static> Subsystem<T> {
 }
 
 impl<T: Clone> Subsystem<T> {
-    pub async fn join(&self) -> Result<T, SubsystemError> {
+    pub async fn join(&self) -> std::result::Result<T, RootSystemError> {
         let mut join_handle = self.join_handle.1.clone();
 
         if join_handle.wait_for(|it| it.is_some()).await.is_err() {
-            return Err(SubsystemError::ForcedShutdown);
+            return Err(RootSystemError::ForcedShutdown);
         }
 
         join_handle
@@ -1106,7 +1228,7 @@ impl<T: Clone> Subsystem<T> {
 }
 
 async fn local_shutdown_timeout<T>(
-    mut join_handle: watch::Receiver<Option<Result<T, SubsystemError>>>,
+    mut join_handle: watch::Receiver<Option<std::result::Result<T, RootSystemError>>>,
     id: SubsystemId,
     cancel_clean_shutdown: CancellationToken,
     shutdown_timeout: Duration,
@@ -1189,5 +1311,41 @@ impl<F: Future> CancelOnShutdown for F {
             _ = subsystem.shutdown_requested() => None,
             output = self => Some(output),
         }
+    }
+}
+
+#[cfg(test)]
+mod generic_error_tests {
+    use super::*;
+    use miette::{Context, IntoDiagnostic, bail};
+
+    fn chained() -> miette::Result<()> {
+        let inner: miette::Result<()> = (|| bail!("aargh"))();
+        inner
+            .wrap_err("failed to do the first thing")
+            .wrap_err("failed to do the second thing")
+    }
+
+    #[test]
+    fn report_chain_survives_into_diagnostic() {
+        let err = chained().expect_err("chain must fail").into_generic_error();
+        let root: std::result::Result<(), _> = Err(RootSystemError::Error(
+            SubsystemId::unassigned_root("test".into()),
+            err,
+        ));
+        let rendered = format!("{:?}", root.into_diagnostic().expect_err("must be Err"));
+        for needle in ["second thing", "first thing", "aargh"] {
+            assert!(
+                rendered.contains(needle),
+                "missing {needle:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn opaque_errors_still_work() {
+        let err = "just a string".to_string().into_generic_error();
+        assert_eq!(err.to_string(), "just a string");
+        assert!(std::error::Error::source(&err).is_none());
     }
 }
