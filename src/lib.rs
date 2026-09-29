@@ -246,29 +246,28 @@ impl IntoExitCode for () {
     }
 }
 
+pub type ExitCodeResult = std::result::Result<ExitCode, GenericError>;
+
 pub trait IntoExitCodeResult {
-    type Output: IntoExitCode;
     type E: IntoGenericError;
-    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E>;
+    fn into_exit_code_result(self) -> ExitCodeResult;
 }
 
 impl<C: IntoExitCode> IntoExitCodeResult for C {
-    type Output = C;
     type E = Infallible;
 
-    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E> {
-        Ok(self)
+    fn into_exit_code_result(self) -> ExitCodeResult {
+        Ok(self.into_exit_code())
     }
 }
 
 impl<E: IntoGenericError> IntoExitCodeResult for std::result::Result<(), E> {
-    type Output = ExitCode;
     type E = E;
 
-    fn into_exit_code_result(self) -> std::result::Result<Self::Output, Self::E> {
+    fn into_exit_code_result(self) -> ExitCodeResult {
         match self {
             Ok(()) => Ok(ExitCode::SUCCESS),
-            Err(err) => Err(err),
+            Err(err) => Err(err.into_generic_error()),
         }
     }
 }
@@ -420,11 +419,7 @@ impl RootBuilder {
         trace!(metrics_event = %event);
 
         // run the actual root system function
-        match subsys(handle)
-            .await
-            .into_exit_code_result()
-            .map(IntoExitCode::into_exit_code)
-        {
+        match subsys(handle).await.into_exit_code_result() {
             Ok(ExitCode::SUCCESS) => {
                 let event = MetricsEvent::RootSystemStopped {
                     id,
@@ -442,8 +437,7 @@ impl RootBuilder {
                 trace!(metrics_event = %event);
                 crash.set_exit_code(exit_code);
             }
-            Err(e) => {
-                let generic_error = e.into_generic_error();
+            Err(generic_error) => {
                 let event = MetricsEvent::RootSystemStopped {
                     id: id.clone(),
                     outcome: Outcome::TerminatedWithError(generic_error.to_string()),
@@ -686,27 +680,41 @@ pub trait GenErr: Debug + Display + Send + Sync + 'static {}
 
 impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
 
-#[derive(Clone)]
-enum GenericErrorRepr {
-    Report(Arc<miette::Report>),
-    Opaque(Arc<dyn GenErr>),
-}
+#[derive(Debug, Error)]
+#[error("{0}")]
+struct GenErrWrapper<E: GenErr>(E);
 
 #[derive(Clone)]
-pub struct GenericError(GenericErrorRepr);
+pub struct GenericError(Arc<miette::Report>);
 
-impl From<miette::Report> for GenericError {
-    fn from(err: miette::Report) -> Self {
-        GenericError(GenericErrorRepr::Report(Arc::new(err)))
+impl GenericError {
+    fn new<E: GenErr>(err: E) -> Self {
+        let mut slot = Some(err);
+        if (&mut slot as &mut dyn Any)
+            .downcast_mut::<Option<miette::Report>>()
+            .is_some()
+        {
+            panic!("don't call GenericError::new with a miette::Report!");
+        }
+
+        let err = Err::<(), _>(GenErrWrapper(
+            slot.take().expect("this is never consumed before"),
+        ))
+        .into_diagnostic()
+        .expect_err("we explicitly constructed an Err here, so it can't be an Ok");
+        Self(Arc::new(err))
     }
 }
 
-impl GenericError {
-    fn report(&self) -> Option<&miette::Report> {
-        match &self.0 {
-            GenericErrorRepr::Report(report) => Some(report),
-            GenericErrorRepr::Opaque(_) => None,
-        }
+impl fmt::Debug for GenericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl fmt::Display for GenericError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -714,41 +722,47 @@ impl GenericError {
 // source()/diagnostic_source() continue from the wrapped report's own chain instead of adding a node.
 impl std::error::Error for GenericError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.report().and_then(|r| std::error::Error::source(&**r))
+        self.0.source()
     }
 }
 
 impl Diagnostic for GenericError {
     fn code<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
-        self.report().and_then(|r| r.code())
+        self.0.code()
     }
 
     fn severity(&self) -> Option<miette::Severity> {
-        self.report().and_then(|r| r.severity())
+        self.0.severity()
     }
 
     fn help<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
-        self.report().and_then(|r| r.help())
+        self.0.help()
     }
 
     fn url<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
-        self.report().and_then(|r| r.url())
+        self.0.url()
     }
 
     fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-        self.report().and_then(|r| r.source_code())
+        self.0.source_code()
     }
 
     fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-        self.report().and_then(|r| r.labels())
+        self.0.labels()
     }
 
     fn related<'a>(&'a self) -> Option<Box<dyn Iterator<Item = &'a dyn Diagnostic> + 'a>> {
-        self.report().and_then(|r| r.related())
+        self.0.related()
     }
 
     fn diagnostic_source(&self) -> Option<&dyn Diagnostic> {
-        self.report().and_then(|r| r.diagnostic_source())
+        self.0.diagnostic_source()
+    }
+}
+
+impl From<miette::Report> for GenericError {
+    fn from(err: miette::Report) -> Self {
+        GenericError(Arc::new(err))
     }
 }
 
@@ -807,26 +821,8 @@ impl<E: GenErr> IntoGenericError for E {
             return report.into();
         }
         match slot {
-            Some(err) => GenericError(GenericErrorRepr::Opaque(Arc::new(err))),
+            Some(err) => GenericError::new(err),
             None => unreachable!("slot is only emptied on the Report path"),
-        }
-    }
-}
-
-impl fmt::Debug for GenericError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            GenericErrorRepr::Report(report) => write!(f, "{report:?}"),
-            GenericErrorRepr::Opaque(err) => write!(f, "{err:?}"),
-        }
-    }
-}
-
-impl fmt::Display for GenericError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            GenericErrorRepr::Report(report) => write!(f, "{report}"),
-            GenericErrorRepr::Opaque(err) => write!(f, "{err}"),
         }
     }
 }
