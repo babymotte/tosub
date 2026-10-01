@@ -210,7 +210,7 @@ impl Clone for CrashHolder {
 impl CrashHolder {
     fn set_exit_code(&self, code: ExitCode) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        if guard.is_ok() {
+        if let Ok(ExitCode::SUCCESS) = *guard {
             *guard = Ok(code);
             self.cancel.cancel();
         }
@@ -218,7 +218,7 @@ impl CrashHolder {
 
     fn set_crash(&self, err: RootSystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        if guard.is_ok() {
+        if let Ok(ExitCode::SUCCESS) = *guard {
             *guard = Err(err);
             self.cancel.cancel();
         }
@@ -246,7 +246,7 @@ impl IntoExitCode for () {
     }
 }
 
-pub type ExitCodeResult = std::result::Result<ExitCode, GenericError>;
+pub type ExitCodeResult = GenericResult<ExitCode>;
 
 pub trait IntoExitCodeResult {
     type E: IntoGenericError;
@@ -676,35 +676,39 @@ pub enum RootSystemError {
     ForcedShutdown,
 }
 
-pub trait GenErr: Debug + Display + Send + Sync + 'static {}
+type BoxedStdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-impl<E> GenErr for E where E: Debug + Display + Send + Sync + 'static {}
+/// Anything that can be turned into a boxed [`std::error::Error`]: every error type, `String`,
+/// `&str` and [`miette::Report`]. Going through `std::error::Error` keeps the cause chain intact.
+pub trait GenErr: Into<BoxedStdError> + Send + Sync + 'static {}
 
-#[derive(Debug, Error)]
-#[error("{0}")]
-struct GenErrWrapper<E: GenErr>(E);
+impl<E> GenErr for E where E: Into<BoxedStdError> + Send + Sync + 'static {}
+
+// Box<dyn Error> does not implement Error itself, so this forwards Display, Debug and source().
+struct BoxedErrorWrapper(BoxedStdError);
+
+impl fmt::Debug for BoxedErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Display for BoxedErrorWrapper {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for BoxedErrorWrapper {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
 
 #[derive(Clone)]
 pub struct GenericError(Arc<miette::Report>);
 
-impl GenericError {
-    fn new<E: GenErr>(err: E) -> Self {
-        let mut slot = Some(err);
-        if (&mut slot as &mut dyn Any)
-            .downcast_mut::<Option<miette::Report>>()
-            .is_some()
-        {
-            panic!("don't call GenericError::new with a miette::Report!");
-        }
-
-        let err = Err::<(), _>(GenErrWrapper(
-            slot.take().expect("this is never consumed before"),
-        ))
-        .into_diagnostic()
-        .expect_err("we explicitly constructed an Err here, so it can't be an Ok");
-        Self(Arc::new(err))
-    }
-}
+type GenericResult<T> = std::result::Result<T, GenericError>;
 
 impl fmt::Debug for GenericError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -812,7 +816,7 @@ impl<T, E: IntoGenericError> IntoRootSystemResult<T> for std::result::Result<T, 
 
 impl<E: GenErr> IntoGenericError for E {
     fn into_generic_error(self) -> GenericError {
-        // No specialization available, so detect miette::Report at runtime to keep its cause chain.
+        // No specialization available, so detect miette::Report at runtime to keep its diagnostics.
         let mut slot = Some(self);
         if let Some(report) = (&mut slot as &mut dyn Any)
             .downcast_mut::<Option<miette::Report>>()
@@ -820,10 +824,11 @@ impl<E: GenErr> IntoGenericError for E {
         {
             return report.into();
         }
-        match slot {
-            Some(err) => GenericError::new(err),
-            None => unreachable!("slot is only emptied on the Report path"),
-        }
+        let err = slot.expect("slot is only emptied on the Report path");
+        let report = Err::<(), _>(BoxedErrorWrapper(err.into()))
+            .into_diagnostic()
+            .expect_err("we explicitly constructed an Err here, so it can't be an Ok");
+        report.into()
     }
 }
 
@@ -1065,7 +1070,7 @@ impl<T> Subsystem<T> {
     }
 
     async fn subsystem_joined<ChildT: Send + Sync>(
-        res: std::result::Result<std::result::Result<ChildT, GenericError>, JoinError>,
+        res: std::result::Result<GenericResult<ChildT>, JoinError>,
         subsystems: SubsystemMap,
         id: SubsystemId,
         crash: &mut CrashHolder,
@@ -1331,6 +1336,37 @@ mod generic_error_tests {
         ));
         let rendered = format!("{:?}", root.into_diagnostic().expect_err("must be Err"));
         for needle in ["second thing", "first thing", "aargh"] {
+            assert!(
+                rendered.contains(needle),
+                "missing {needle:?} in:\n{rendered}"
+            );
+        }
+    }
+
+    #[derive(Debug, Error)]
+    enum StdChain {
+        #[error("io failed")]
+        Io(#[source] std::io::Error),
+        #[error("{0}")]
+        Wrapped(&'static str, #[source] Box<StdChain>),
+    }
+
+    #[test]
+    fn std_error_chain_survives() {
+        let err = StdChain::Wrapped(
+            "failed to do the second thing",
+            Box::new(StdChain::Wrapped(
+                "failed to do the first thing",
+                Box::new(StdChain::Io(std::io::Error::other("aargh"))),
+            )),
+        )
+        .into_generic_error();
+        let root: std::result::Result<(), _> = Err(RootSystemError::Error(
+            SubsystemId::unassigned_root("test".into()),
+            err,
+        ));
+        let rendered = format!("{:?}", root.into_diagnostic().expect_err("must be Err"));
+        for needle in ["second thing", "first thing", "io failed", "aargh"] {
             assert!(
                 rendered.contains(needle),
                 "missing {needle:?} in:\n{rendered}"
