@@ -99,6 +99,14 @@ impl SubsystemId {
     fn path_iter<'a>(&'a self) -> IdPathIter<'a> {
         IdPathIter(Some(self))
     }
+
+    fn mock(name: String) -> SubsystemId {
+        SubsystemId {
+            name,
+            task_id: 0,
+            parent: None,
+        }
+    }
 }
 
 struct IdPathIter<'a>(Option<&'a SubsystemId>);
@@ -208,10 +216,14 @@ impl Clone for CrashHolder {
 }
 
 impl CrashHolder {
-    fn set_exit_code(&self, code: ExitCode) {
+    fn set_exit_code(&self, code: ExitCode, cause: &SubsystemId) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         if let Ok(ExitCode::SUCCESS) = *guard {
             *guard = Ok(code);
+            info!(
+                "Requesting global shutdown because subsystem {} terminated with non-zero exit code.",
+                cause
+            );
             self.cancel.cancel();
         }
     }
@@ -219,7 +231,9 @@ impl CrashHolder {
     fn set_crash(&self, err: RootSystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
         if let Ok(ExitCode::SUCCESS) = *guard {
+            let msg = err.to_string();
             *guard = Err(err);
+            error!("Requesting global shutdown due to crash: {}", msg);
             self.cancel.cancel();
         }
     }
@@ -301,7 +315,7 @@ impl RootBuilder {
         };
 
         if self.catch_signals {
-            self.register_signal_handlers(&global, crash.clone());
+            self.register_signal_handlers(crash.clone());
         }
 
         let stdin_consumer = self.stdin_consumer.take();
@@ -435,7 +449,7 @@ impl RootBuilder {
                     ),
                 };
                 trace!(metrics_event = %event);
-                crash.set_exit_code(exit_code);
+                crash.set_exit_code(exit_code, &id);
             }
             Err(generic_error) => {
                 let event = MetricsEvent::RootSystemStopped {
@@ -450,6 +464,7 @@ impl RootBuilder {
         // root system completed, request shutdown of all subsystems
 
         if !global.is_cancelled() {
+            info!("Root system completed, initiating shutdown of all subsystems.");
             glob.cancel();
         }
     }
@@ -521,12 +536,11 @@ impl RootBuilder {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
-    fn register_signal_handlers(&self, global: &CancellationToken, crash: CrashHolder) {
+    fn register_signal_handlers(&self, crash: CrashHolder) {
         use tokio::signal::unix::{SignalKind, signal};
 
         if let Ok(signal) = signal(SignalKind::hangup()) {
             handle_unix_signal(
-                global,
                 signal,
                 "SIGHUP",
                 SignalKind::hangup().as_raw_value(),
@@ -538,7 +552,6 @@ impl RootBuilder {
 
         if let Ok(signal) = signal(SignalKind::interrupt()) {
             handle_unix_signal(
-                global,
                 signal,
                 "SIGINT",
                 SignalKind::interrupt().as_raw_value(),
@@ -550,7 +563,6 @@ impl RootBuilder {
 
         if let Ok(signal) = signal(SignalKind::quit()) {
             handle_unix_signal(
-                global,
                 signal,
                 "SIGQUIT",
                 SignalKind::quit().as_raw_value(),
@@ -562,7 +574,6 @@ impl RootBuilder {
 
         if let Ok(signal) = signal(SignalKind::terminate()) {
             handle_unix_signal(
-                global,
                 signal,
                 "SIGTERM",
                 SignalKind::terminate().as_raw_value(),
@@ -605,8 +616,10 @@ fn gobble_stdin<F: Fn(String)>(
 
                 if shutdown_on_stdin_close {
                     info!("Initiating shutdown.");
-                    crash.set_exit_code(ExitCode::FAILURE);
-                    global.cancel();
+                    crash.set_exit_code(
+                        ExitCode::FAILURE,
+                        &SubsystemId::mock("Stdin handler".to_owned()),
+                    );
                 }
                 return;
             }
@@ -620,13 +633,11 @@ fn gobble_stdin<F: Fn(String)>(
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 fn handle_unix_signal(
-    global: &CancellationToken,
     mut signal: tokio::signal::unix::Signal,
     signal_name: &'static str,
     code: i32,
     crash: CrashHolder,
 ) {
-    let global = global.clone();
     let task_name = format!("Signal handler: {signal_name}");
     spawn_task(
         async move {
@@ -645,8 +656,10 @@ fn handle_unix_signal(
                 }
                 already_triggered = true;
                 info!("Received {signal_name} signal, initiating shutdown.");
-                crash.set_exit_code(ExitCode::from(128 + code as u8));
-                global.cancel();
+                crash.set_exit_code(
+                    ExitCode::from(128 + code as u8),
+                    &SubsystemId::mock(format!("Signal handler ({code})")),
+                );
             }
             process::exit(128 + code);
         },
@@ -932,7 +945,14 @@ impl<T> Subsystem<T> {
     }
 
     pub fn request_global_shutdown(&self) {
-        info!("Global shutdown requested from subsystem '{}'", self.id);
+        self.request_global_shutdown_because("global shutdown explicitly requested");
+    }
+
+    pub fn request_global_shutdown_because(&self, msg: impl Display) {
+        info!(
+            "Global shutdown requested from subsystem '{}': {}",
+            self.id, msg
+        );
         self.global.cancel();
     }
 
@@ -1186,7 +1206,14 @@ impl<T> Subsystem<T> {
 
 impl<T: Send + Sync + 'static> Subsystem<T> {
     pub fn request_local_shutdown(&self) {
-        info!("Local shutdown requested for subsystem '{}'", self.id);
+        self.request_local_shutdown_because("local shutdown explicitly requested");
+    }
+
+    pub fn request_local_shutdown_because(&self, msg: impl Display) {
+        info!(
+            "Local shutdown requested for subsystem '{}': {}",
+            self.id, msg
+        );
         self.local.cancel();
         let id = self.id.clone();
 
