@@ -27,7 +27,6 @@ use std::{
     convert::Infallible,
     fmt::{self, Debug, Display},
     io::stdin,
-    mem,
     process::{self, ExitCode},
     sync::{Arc, Mutex},
     thread,
@@ -246,7 +245,7 @@ impl CrashHolder {
 
     fn take_crash(&self) -> Option<RootSystemResult> {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        mem::replace(&mut *guard, Some(Ok(ExitCode::SUCCESS)))
+        (*guard).replace(Ok(ExitCode::SUCCESS))
     }
 }
 
