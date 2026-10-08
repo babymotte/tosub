@@ -52,11 +52,11 @@ async fn main() -> miette::Result<ExitCode> {
         .await
 }
 
-async fn service_loop(subsys: tosub::Subsystem, duration: Duration) -> miette::Result<()> {
+async fn service_loop(subsys: tosub::Subsystem, duration: Duration) -> Option<()> {
     info!("Service {} started.", subsys.name());
 
     loop {
-        let runner = subsys.spawn("runner", move |s| service_runner(s, duration));
+        let runner = subsys.spawn("runner", move |s| service_runner(s, duration))?;
         select! {
             _ = runner.join() => {
                 info!("Service {} runner stopped. Restarting...", subsys.name());
@@ -68,7 +68,7 @@ async fn service_loop(subsys: tosub::Subsystem, duration: Duration) -> miette::R
         }
     }
 
-    Ok(())
+    Some(())
 }
 
 async fn service_runner(s: Subsystem, duration: Duration) -> miette::Result<()> {

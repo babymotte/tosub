@@ -60,5 +60,5 @@ fn do_the_second_thing() -> miette::Result<()> {
 }
 
 fn do_the_first_thing() -> miette::Result<()> {
-    bail!("aargh")
+    bail!("aargh");
 }

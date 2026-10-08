@@ -18,7 +18,7 @@
  * limitations under the License.
  */
 
-use miette::{Diagnostic, IntoDiagnostic};
+use miette::{Diagnostic, IntoDiagnostic, miette};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -45,14 +45,20 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubsystemId {
     name: String,
     task_id: u64,
     parent: Option<Box<SubsystemId>>,
+}
+
+impl fmt::Debug for SubsystemId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.task_id, self.path())
+    }
 }
 
 impl PartialOrd for SubsystemId {
@@ -202,7 +208,7 @@ pub struct RootBuilder {
 }
 
 struct CrashHolder {
-    crash: Arc<Mutex<RootSystemResult>>,
+    crash: Arc<Mutex<Option<RootSystemResult>>>,
     cancel: CancellationToken,
 }
 
@@ -218,8 +224,8 @@ impl Clone for CrashHolder {
 impl CrashHolder {
     fn set_exit_code(&self, code: ExitCode, cause: &SubsystemId) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        if let Ok(ExitCode::SUCCESS) = *guard {
-            *guard = Ok(code);
+        if guard.is_none() {
+            *guard = Some(Ok(code));
             info!(
                 "Requesting global shutdown because subsystem {} terminated with non-zero exit code.",
                 cause
@@ -230,17 +236,17 @@ impl CrashHolder {
 
     fn set_crash(&self, err: RootSystemError) {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        if let Ok(ExitCode::SUCCESS) = *guard {
+        if guard.is_none() {
             let msg = err.to_string();
-            *guard = Err(err);
+            *guard = Some(Err(err));
             error!("Requesting global shutdown due to crash: {}", msg);
             self.cancel.cancel();
         }
     }
 
-    fn take_crash(&self) -> RootSystemResult {
+    fn take_crash(&self) -> Option<RootSystemResult> {
         let mut guard = self.crash.lock().expect("mutex is poisoned");
-        mem::replace(&mut *guard, Ok(ExitCode::SUCCESS))
+        mem::replace(&mut *guard, Some(Ok(ExitCode::SUCCESS)))
     }
 }
 
@@ -272,6 +278,14 @@ impl<C: IntoExitCode> IntoExitCodeResult for C {
 
     fn into_exit_code_result(self) -> ExitCodeResult {
         Ok(self.into_exit_code())
+    }
+}
+
+impl<C: IntoExitCode> IntoExitCodeResult for Option<C> {
+    type E = Infallible;
+
+    fn into_exit_code_result(self) -> ExitCodeResult {
+        Ok(self.map_or(ExitCode::SUCCESS, C::into_exit_code))
     }
 }
 
@@ -310,7 +324,7 @@ impl RootBuilder {
         let local = global.child_token();
 
         let crash = CrashHolder {
-            crash: Arc::new(Mutex::new(Ok(ExitCode::SUCCESS))),
+            crash: Arc::new(Mutex::new(None)),
             cancel: global.clone(),
         };
 
@@ -335,7 +349,7 @@ impl RootBuilder {
         let cancel_clean_global_shutdown = CancellationToken::new();
         let cancel_clean_local_shutdown = CancellationToken::new();
 
-        let subsystems = Arc::new(Mutex::new(BTreeMap::new()));
+        let subsystems = GC::default();
 
         let handle = Subsystem {
             id: SubsystemId::unassigned_root(self.name.clone()),
@@ -357,10 +371,7 @@ impl RootBuilder {
                 Self::run_root_system(subsys, &global, &crash, handle, &glob).await;
 
                 // collect terminaion signals of remaining subsystems and wait for them to trigger
-                let subsystems = {
-                    let mut subsystems = subsystems.lock().expect("mutex is poisoned");
-                    std::mem::take(&mut *subsystems)
-                };
+                let subsystems = subsystems.take_remaining_subsystems();
                 let subsys_shutdown_future = wait_for_subsystems_shutdown(subsystems);
 
                 if let Some(to) = self.shutdown_timeout {
@@ -384,10 +395,8 @@ impl RootBuilder {
                     }
 
                     // trigger join handle of root system
-                    res_tx.send(crash.take_crash()).ok();
-                    join_tx
-                        .send(Some(Err(RootSystemError::ForcedShutdown)))
-                        .ok();
+                    let _ = res_tx.send(crash.take_crash());
+                    let _ = join_tx.send(Some(Err(RootSystemError::ForcedShutdown)));
                 } else {
                     info!("Shutdown initiated, waiting for clean shutdown.");
 
@@ -395,17 +404,18 @@ impl RootBuilder {
                     subsys_shutdown_future.await;
                     info!("All subsystems have shut down.");
 
-                    res_tx.send(crash.take_crash()).ok();
-                    join_tx
-                        .send(Some(Err(RootSystemError::OrderlyShutdown)))
-                        .ok();
+                    let _ = res_tx.send(crash.take_crash());
+                    let _ = join_tx.send(Some(Err(RootSystemError::OrderlyShutdown)));
                 }
             },
             &task_name,
         );
 
         // block on root system to run and clean up
-        res_rx.await.unwrap_or(Err(RootSystemError::ForcedShutdown))
+        res_rx
+            .await
+            .unwrap_or(Some(Err(RootSystemError::ForcedShutdown)))
+            .unwrap_or(Ok(ExitCode::SUCCESS))
     }
 
     async fn run_root_system<F, R>(
@@ -514,25 +524,29 @@ impl RootBuilder {
         use tokio::signal::ctrl_c;
 
         let global = global.clone();
-        let task_id = spawn(async move {
-            let mut counter = 0;
-            loop {
-                ctrl_c().await.expect("Ctrl+C handler not supported");
-                counter += 1;
-                if counter > 1 {
-                    break;
+        let task_name = format!("Signal handler: Ctrl+C");
+        let task_id = spawn_task(
+            async move {
+                let mut counter = 0;
+                loop {
+                    ctrl_c().await.expect("Ctrl+C handler not supported");
+                    counter += 1;
+                    if counter > 1 {
+                        break;
+                    }
+                    info!("Received Ctrl+C, initiating shutdown.");
+                    global.cancel();
                 }
-                info!("Received Ctrl+C, initiating shutdown.");
-                global.cancel();
-            }
-            process::exit(1);
-        })
+                process::exit(1);
+            },
+            &task_name,
+        )
         .id();
         let event = MetricsEvent::TaskSpawned(TaskInfo {
             id: to_u64(&task_id),
             task_type: TaskType::SignalHandler("Ctrl+C".to_owned()),
         });
-        self.metrics_tx.try_send(event).ok();
+        let _ = self.metrics_tx.try_send(event);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -792,6 +806,28 @@ pub trait IntoGenericResult {
     fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError>;
 }
 
+impl IntoGenericResult for Option<()> {
+    type Output = ();
+
+    fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError> {
+        Ok(())
+    }
+}
+
+impl<T> IntoGenericResult for Option<Subsystem<T>>
+where
+    T: Send + Sync + 'static,
+{
+    type Output = Subsystem<T>;
+
+    fn into_generic_result(self) -> std::result::Result<Self::Output, GenericError> {
+        self.ok_or_else(|| {
+            miette!("Could not spawn child subsystem because shutdown has been requested")
+                .into_generic_error()
+        })
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static, Err> IntoGenericResult for std::result::Result<T, Err>
 where
     Err: IntoGenericError,
@@ -849,7 +885,7 @@ pub type RootSystemResult<T = ExitCode> = std::result::Result<T, RootSystemError
 
 async fn wait_for_subsystems_shutdown(subsystems: BTreeMap<SubsystemId, oneshot::Receiver<()>>) {
     for rx in subsystems.into_values() {
-        rx.await.ok();
+        let _ = rx.await;
     }
 }
 
@@ -858,13 +894,39 @@ type ResultWatchReceiver<T> = watch::Receiver<Option<RootSystemResult<T>>>;
 
 type ResultWatchChannel<T> = (ResultWatchSender<T>, ResultWatchReceiver<T>);
 
+#[derive(Debug, Clone, Default)]
+struct GC(SubsystemMap);
+
+impl GC {
+    fn insert_and_get_all(
+        &self,
+        subsystem_id: SubsystemId,
+        gc_rx: oneshot::Receiver<()>,
+    ) -> Box<[SubsystemId]> {
+        let mut gc = self.0.lock().expect("mutex is poisoned");
+        gc.insert(subsystem_id, gc_rx);
+        gc.keys().cloned().collect::<Box<[_]>>()
+    }
+
+    fn remove_and_get_remaining(&self, id: &SubsystemId) -> Box<[SubsystemId]> {
+        let mut gc = self.0.lock().expect("mutex is poisoned");
+        gc.remove(id);
+        gc.keys().cloned().collect::<Box<[_]>>()
+    }
+
+    fn take_remaining_subsystems(self) -> BTreeMap<SubsystemId, oneshot::Receiver<()>> {
+        let mut gc = self.0.lock().expect("mutex is poisoned");
+        std::mem::take(&mut *gc)
+    }
+}
+
 pub struct Subsystem<T = ()> {
     id: SubsystemId,
     local: CancellationToken,
     global: CancellationToken,
     cancel_clean_global_shutdown: CancellationToken,
     cancel_clean_local_shutdown: CancellationToken,
-    subsystems: SubsystemMap,
+    subsystems: GC,
     crash: CrashHolder,
     join_handle: ResultWatchChannel<T>,
     shutdown_timeout: Option<Duration>,
@@ -958,20 +1020,31 @@ impl<T> Subsystem<T> {
 
     pub fn spawn<ChildT>(
         &self,
-        name: impl Into<String>,
+        name: impl Display,
         subsys: impl SubsystemFunction<ChildT>,
-    ) -> Subsystem<ChildT>
+    ) -> Option<Subsystem<ChildT>>
     where
         ChildT: Clone + Send + Sync + 'static,
     {
+        if self.is_shut_down() {
+            warn!(
+                "Cannot spawn new subsystem '{}/{}' because parent subsystem '{}' has shut down.",
+                self.id.path(),
+                name,
+                self.id.path()
+            );
+            return None;
+        }
+
         let cancel_clean_global_shutdown = self.cancel_clean_global_shutdown.clone();
         let cancel_clean_local_shutdown = CancellationToken::new();
 
-        let (mut handle, gc_rx) = self.create_child(
+        let mut handle = self.create_child(
             name,
             cancel_clean_global_shutdown.clone(),
             cancel_clean_local_shutdown.clone(),
         );
+        let (gc_tx, gc_rx) = oneshot::channel();
         let full_name = handle.id.path();
         let fname = full_name.clone();
         let subsys_task_name = format!("Subsystem: {fname}");
@@ -1015,92 +1088,71 @@ impl<T> Subsystem<T> {
 
                 select! {
                     biased;
-                    res = &mut join_handle => Self::subsystem_joined(res, subsystems, subsystem_id_2, &mut crash, res_tx).await,
+                    res = &mut join_handle => Self::subsystem_joined(res, subsystems, subsystem_id_2, &mut crash, res_tx, gc_tx).await,
                     _ = cancel_clean_global_shutdown.cancelled() => Self::global_shutdown_timed_out(join_handle, subsystem_id_2, &glob, &mut crash).await,
-                    _ = cancel_clean_local_shutdown.cancelled() => Self::subsystem_timed_out(join_handle, subsystems, subsystem_id_2, res_tx).await,
+                    _ = cancel_clean_local_shutdown.cancelled() => Self::subsystem_timed_out(join_handle, subsystems, subsystem_id_2, res_tx, gc_tx).await,
                 };
             },
             &cancellation_task_name,
         );
 
-        let all_running = {
-            let mut gc = self.subsystems.lock().expect("mutex is poisoned");
-            gc.insert(subsystem_id.clone(), gc_rx);
-            gc.keys().cloned().collect::<Box<[_]>>()
-        };
+        let all_running = self
+            .subsystems
+            .insert_and_get_all(subsystem_id.clone(), gc_rx);
 
         let event = MetricsEvent::SubsystemStarted {
             id: subsystem_id.clone(),
             all_running: all_running.clone(),
         };
-        trace!(metrics_event = %event, "Subsystem '{}' started. List of all running subsytems: {:#?}", subsystem_id.name, all_running);
+        debug!(
+            "Subsystem '{}' started. List of all running subsytems: {:#?}",
+            subsystem_id.name, all_running
+        );
+        trace!(metrics_event = %event);
 
-        handle
+        Some(handle)
     }
 
     fn create_child<ChildT: Send + Sync + 'static>(
         &self,
-        name: impl Into<String>,
+        name: impl Display,
         cancel_clean_global_shutdown: CancellationToken,
         cancel_clean_local_shutdown: CancellationToken,
-    ) -> (Subsystem<ChildT>, oneshot::Receiver<()>) {
+    ) -> Subsystem<ChildT> {
         let (res_tx, res_rx) =
             watch::channel::<Option<std::result::Result<ChildT, RootSystemError>>>(None);
-        let name = name.into();
+        let name = name.to_string();
         let global = self.global.clone();
         let local = self.local.child_token();
         let subsystems = self.subsystems.clone();
         let crash = self.crash.clone();
-
-        let (gc_tx, gc_rx) = oneshot::channel();
-        let mut gc_res_rx = res_rx.clone();
-
         let id = self.id.unassigned_child(name.clone());
-        let id_2 = id.clone();
-        let task_name = format!("Join: {name}");
 
-        spawn_task(
-            async move {
-                let task_id = task_id();
-                let event = MetricsEvent::TaskSpawned(TaskInfo {
-                    id: task_id,
-                    task_type: TaskType::JoinSignal(id_2),
-                });
-                trace!(metrics_event = %event);
-                gc_res_rx.wait_for(|it| it.is_some()).await.ok();
-                gc_tx.send(()).ok();
-            },
-            &task_name,
-        );
-
-        (
-            Subsystem {
-                id,
-                global,
-                local,
-                cancel_clean_global_shutdown,
-                cancel_clean_local_shutdown,
-                subsystems,
-                crash,
-                join_handle: (res_tx, res_rx),
-                shutdown_timeout: self.shutdown_timeout,
-            },
-            gc_rx,
-        )
+        Subsystem {
+            id,
+            global,
+            local,
+            cancel_clean_global_shutdown,
+            cancel_clean_local_shutdown,
+            subsystems,
+            crash,
+            join_handle: (res_tx, res_rx),
+            shutdown_timeout: self.shutdown_timeout,
+        }
     }
 
     async fn subsystem_joined<ChildT: Send + Sync>(
         res: std::result::Result<GenericResult<ChildT>, JoinError>,
-        subsystems: SubsystemMap,
+        subsystems: GC,
         id: SubsystemId,
         crash: &mut CrashHolder,
         res_tx: ResultWatchSender<ChildT>,
+        gc_tx: oneshot::Sender<()>,
     ) {
-        let all_running = {
-            let mut gc = subsystems.lock().expect("mutex is poisoned");
-            gc.remove(&id);
-            gc.keys().cloned().collect::<Box<[_]>>()
-        };
+        trace!("tokio task of subsystem '{}' joined", id.path());
+        let _ = gc_tx.send(());
+
+        let all_running = subsystems.remove_and_get_remaining(&id);
 
         match res {
             Ok(Ok(it)) => {
@@ -1109,8 +1161,12 @@ impl<T> Subsystem<T> {
                     outcome: Outcome::TerminatedNormally,
                     all_running: all_running.clone(),
                 };
-                trace!(metrics_event = %event, "Subsystem '{}' terminated normally. List of all remaining subsytems: {:#?}", id.name, all_running);
-                res_tx.send(Some(Ok(it))).ok();
+                debug!(
+                    "Subsystem '{}' terminated normally. List of all remaining subsytems: {:#?}",
+                    id.name, all_running
+                );
+                trace!(metrics_event = %event);
+                let _ = res_tx.send(Some(Ok(it)));
             }
             Ok(Err(e)) => {
                 let event = MetricsEvent::SubsystemStopped {
@@ -1118,10 +1174,14 @@ impl<T> Subsystem<T> {
                     outcome: Outcome::TerminatedWithError(e.to_string()),
                     all_running: all_running.clone(),
                 };
-                trace!(metrics_event = %event, "Subsystem '{}' terminated with error: {e}. List of all remaining subsytems: {:#?}", id.name, all_running);
+                debug!(
+                    "Subsystem '{}' terminated with error: {e}. List of all remaining subsytems: {:#?}",
+                    id.name, all_running
+                );
+                trace!(metrics_event = %event);
                 let err = RootSystemError::Error(id, e);
                 crash.set_crash(err.clone());
-                res_tx.send(Some(Err(err))).ok();
+                let _ = res_tx.send(Some(Err(err)));
             }
             Err(e) => {
                 if e.is_panic() {
@@ -1131,10 +1191,14 @@ impl<T> Subsystem<T> {
                         outcome: Outcome::TerminatedWithError(e.to_string()),
                         all_running: all_running.clone(),
                     };
-                    trace!(metrics_event = %event, "Subsystem '{}' panicked: {e}. List of all remaining subsytems: {:#?}", id.name, all_running);
+                    trace!(
+                        "Subsystem '{}' panicked: {e}. List of all remaining subsytems: {:#?}",
+                        id.name, all_running
+                    );
+                    trace!(metrics_event = %event);
                     let err = RootSystemError::Panic(id, miette::Report::from_err(e).into());
                     crash.set_crash(err.clone());
-                    res_tx.send(Some(Err(err))).ok();
+                    let _ = res_tx.send(Some(Err(err)));
                 } else {
                     warn!("Subsystem '{}' was shut down forcefully.", id.name);
                     let event = MetricsEvent::SubsystemStopped {
@@ -1142,10 +1206,14 @@ impl<T> Subsystem<T> {
                         outcome: Outcome::ShutdownForced,
                         all_running: all_running.clone(),
                     };
-                    trace!(metrics_event = %event, "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}", id.name, all_running);
+                    debug!(
+                        "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}",
+                        id.name, all_running
+                    );
+                    trace!(metrics_event = %event);
                     let err = RootSystemError::ForcedShutdown;
                     crash.set_crash(err.clone());
-                    res_tx.send(Some(Err(err))).ok();
+                    let _ = res_tx.send(Some(Err(err)));
                 }
             }
         };
@@ -1153,19 +1221,18 @@ impl<T> Subsystem<T> {
 
     async fn subsystem_timed_out<ChildT, Err>(
         join_handle: tokio::task::JoinHandle<std::result::Result<ChildT, Err>>,
-        subsystems: SubsystemMap,
+        subsystems: GC,
         id: SubsystemId,
         res_tx: watch::Sender<Option<std::result::Result<ChildT, RootSystemError>>>,
+        gc_tx: oneshot::Sender<()>,
     ) where
         Err: Debug + Display + Send + Sync + 'static,
     {
+        let _ = gc_tx.send(());
+
         Self::local_shutdown_timed_out(join_handle, &id).await;
 
-        let all_running = {
-            let mut gc = subsystems.lock().expect("mutex is poisoned");
-            gc.remove(&id);
-            gc.keys().cloned().collect::<Box<[_]>>()
-        };
+        let all_running = subsystems.remove_and_get_remaining(&id);
 
         warn!("Subsystem '{}' was shut down forcefully.", id);
 
@@ -1174,9 +1241,13 @@ impl<T> Subsystem<T> {
             outcome: Outcome::ShutdownForced,
             all_running: all_running.clone(),
         };
-        trace!(metrics_event = %event, "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}", id.name, all_running);
+        debug!(
+            "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}",
+            id.name, all_running
+        );
+        trace!(metrics_event = %event);
 
-        res_tx.send(Some(Err(RootSystemError::ForcedShutdown))).ok();
+        let _ = res_tx.send(Some(Err(RootSystemError::ForcedShutdown)));
     }
 
     async fn global_shutdown_timed_out<ChildT, Err>(
@@ -1344,11 +1415,15 @@ impl<F: Future> CancelOnShutdown for F {
 
 #[cfg(test)]
 mod generic_error_tests {
+
     use super::*;
     use miette::{Context, IntoDiagnostic, bail};
+    use std::future::pending;
 
     fn chained() -> miette::Result<()> {
-        let inner: miette::Result<()> = (|| bail!("aargh"))();
+        let inner: miette::Result<()> = (|| {
+            bail!("aargh");
+        })();
         inner
             .wrap_err("failed to do the first thing")
             .wrap_err("failed to do the second thing")
@@ -1406,5 +1481,19 @@ mod generic_error_tests {
         let err = "just a string".to_string().into_generic_error();
         assert_eq!(err.to_string(), "just a string");
         assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[tokio::test]
+    async fn aborted_task_still_joins() {
+        let handle = tokio::spawn(async {
+            pending::<()>().await;
+        });
+
+        handle.abort();
+
+        timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("this should not time out")
+            .expect_err("this should fail because the task was cancelled");
     }
 }

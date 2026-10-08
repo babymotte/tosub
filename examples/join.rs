@@ -38,15 +38,15 @@ async fn main() -> miette::Result<ExitCode> {
         .catch_signals()
         .with_timeout(Duration::from_secs(1))
         .start(|root| async move {
-            let child1 = root.spawn("child 1", child1);
+            let child1 = root.spawn("child 1", child1)?;
             sleep(Duration::from_millis(10)).await;
-            let child2 = root.spawn("child 2", child2);
+            let child2 = root.spawn("child 2", child2)?;
             sleep(Duration::from_millis(10)).await;
-            let child3 = root.spawn("child 3", child3);
+            let child3 = root.spawn("child 3", child3)?;
             sleep(Duration::from_millis(10)).await;
-            let child4 = root.spawn("child 4", child4);
+            let child4 = root.spawn("child 4", child4)?;
             sleep(Duration::from_millis(10)).await;
-            let child5 = root.spawn("child 5", child5);
+            let child5 = root.spawn("child 5", child5)?;
 
             sleep(Duration::from_millis(10)).await;
 
@@ -75,7 +75,7 @@ async fn main() -> miette::Result<ExitCode> {
             let res = child1.join().await;
             info!("Child 1 done with result: {:?}", res);
 
-            Ok::<(), miette::Report>(())
+            Some(())
         })
         .await
 }

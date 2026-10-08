@@ -19,8 +19,8 @@ async fn main() -> miette::Result<ExitCode> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|s| async move {
-            s.spawn("branch", |s| async move {
-                let tick = s.spawn("tick", |s| async move {
+            let Some(subsys) = s.spawn("branch", |s| async move {
+                let Some(tick) = s.spawn("tick", |s| async move {
                     for i in 0..10 {
                         select! {
                             _ = sleep(Duration::from_millis(950)) => println!("tick {i}"),
@@ -28,9 +28,11 @@ async fn main() -> miette::Result<ExitCode> {
                         }
                     }
                     Ok::<(), miette::Error>(())
-                });
+                }) else {
+                    return Ok(());
+                };
 
-                let tock = s.spawn("tock", |s| async move {
+                let Some(tock) = s.spawn("tock", |s| async move {
                     for i in 0..10 {
                         if i == 4 {
                             return Err(miette::miette!("Oh noes!"));
@@ -41,17 +43,19 @@ async fn main() -> miette::Result<ExitCode> {
                         }
                     }
                     Ok::<(), miette::Error>(())
-                });
+                }) else {
+                    return Ok(());
+                };
 
-                tick.join().await.ok();
-                tock.join().await.ok();
+                let _ = tick.join().await;
+                let _ = tock.join().await;
                 s.request_global_shutdown();
 
                 Ok::<(), miette::Error>(())
-            })
-            .join()
-            .await
-            .ok();
+            }) else {
+                return Ok(());
+            };
+            let _ = subsys.join().await;
 
             Ok::<(), miette::Error>(())
         })

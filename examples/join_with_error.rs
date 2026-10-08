@@ -18,6 +18,7 @@
 use std::{io, process::ExitCode, time::Duration};
 use tokio::select;
 use tokio::time::sleep;
+use tosub::IntoGenericResult;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -38,9 +39,9 @@ async fn main() -> miette::Result<ExitCode> {
         .catch_signals()
         .with_timeout(Duration::from_secs(5))
         .start(|root| async move {
-            let child1 = root.spawn("child 1", child1);
-            let child2 = root.spawn("child 2", child2);
-            let child3 = root.spawn("child 3", child3);
+            let child1 = root.spawn("child 1", child1).into_generic_result()?;
+            let child2 = root.spawn("child 2", child2).into_generic_result()?;
+            let child3 = root.spawn("child 3", child3).into_generic_result()?;
 
             select! {
                 _ = child3.join() => {
@@ -63,7 +64,7 @@ async fn main() -> miette::Result<ExitCode> {
                 _ = root.shutdown_requested() => (),
             }
 
-            Ok::<(), miette::Report>(())
+            Ok::<_, miette::Report>(())
         })
         .await
 }
