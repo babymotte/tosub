@@ -519,10 +519,9 @@ impl RootBuilder {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
-    fn register_signal_handlers(&self, global: &CancellationToken, _: CrashHolder) {
+    fn register_signal_handlers(&self, crash: CrashHolder) {
         use tokio::signal::ctrl_c;
 
-        let global = global.clone();
         let task_name = format!("Signal handler: Ctrl+C");
         let task_id = spawn_task(
             async move {
@@ -534,7 +533,10 @@ impl RootBuilder {
                         break;
                     }
                     info!("Received Ctrl+C, initiating shutdown.");
-                    global.cancel();
+                    crash.set_exit_code(
+                        ExitCode::from(1),
+                        &SubsystemId::mock("Signal handler (Ctrl+C)".to_owned()),
+                    );
                 }
                 process::exit(1);
             },
@@ -542,10 +544,10 @@ impl RootBuilder {
         )
         .id();
         let event = MetricsEvent::TaskSpawned(TaskInfo {
-            id: to_u64(&task_id),
+            id: to_u64(task_id),
             task_type: TaskType::SignalHandler("Ctrl+C".to_owned()),
         });
-        let _ = self.metrics_tx.try_send(event);
+        trace!(metrics_event = %event);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
