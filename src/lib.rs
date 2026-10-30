@@ -51,7 +51,7 @@ use tracing::{debug, error, info, trace, warn};
 pub struct SubsystemId {
     name: String,
     task_id: u64,
-    parent: Option<Box<SubsystemId>>,
+    parent: Option<Arc<SubsystemId>>,
 }
 
 impl fmt::Debug for SubsystemId {
@@ -87,7 +87,7 @@ impl SubsystemId {
         SubsystemId {
             name,
             task_id: 0,
-            parent: Some(Box::new(self.clone())),
+            parent: Some(Arc::new(self.clone())),
         }
     }
 
@@ -899,26 +899,55 @@ type ResultWatchChannel<T> = (ResultWatchSender<T>, ResultWatchReceiver<T>);
 struct GC(SubsystemMap);
 
 impl GC {
+    /// Registers a subsystem. Returns a snapshot of all running subsystems only if
+    /// it is going to be logged, since taking it is O(n) while holding the global lock.
     fn insert_and_get_all(
         &self,
         subsystem_id: SubsystemId,
         gc_rx: oneshot::Receiver<()>,
-    ) -> Box<[SubsystemId]> {
+    ) -> Option<Box<[SubsystemId]>> {
+        let snapshot = tracing::enabled!(tracing::Level::DEBUG);
         let mut gc = self.0.lock().expect("mutex is poisoned");
         gc.insert(subsystem_id, gc_rx);
-        gc.keys().cloned().collect::<Box<[_]>>()
+        snapshot.then(|| gc.keys().cloned().collect::<Box<[_]>>())
     }
 
-    fn remove_and_get_remaining(&self, id: &SubsystemId) -> Box<[SubsystemId]> {
+    /// Unregisters a subsystem. Returns a snapshot of the remaining subsystems only if
+    /// it is going to be logged, since taking it is O(n) while holding the global lock.
+    fn remove_and_get_remaining(&self, id: &SubsystemId) -> Option<Box<[SubsystemId]>> {
+        let snapshot = tracing::enabled!(tracing::Level::DEBUG);
         let mut gc = self.0.lock().expect("mutex is poisoned");
         gc.remove(id);
-        gc.keys().cloned().collect::<Box<[_]>>()
+        snapshot.then(|| gc.keys().cloned().collect::<Box<[_]>>())
     }
 
     fn take_remaining_subsystems(self) -> BTreeMap<SubsystemId, oneshot::Receiver<()>> {
         let mut gc = self.0.lock().expect("mutex is poisoned");
         std::mem::take(&mut *gc)
     }
+}
+
+/// Logs the termination of a subsystem along with the list of remaining subsystems.
+/// `all_running` is only `Some` if debug logging is enabled, see [`GC::remove_and_get_remaining`].
+fn log_subsystem_stopped(
+    id: &SubsystemId,
+    outcome: impl FnOnce() -> Outcome,
+    all_running: Option<Box<[SubsystemId]>>,
+    what: impl Display,
+) {
+    let Some(all_running) = all_running else {
+        return;
+    };
+    debug!(
+        "Subsystem '{}' {what}. List of all remaining subsytems: {:#?}",
+        id.name, all_running
+    );
+    let event = MetricsEvent::SubsystemStopped {
+        id: id.clone(),
+        outcome: outcome(),
+        all_running,
+    };
+    trace!(metrics_event = %event);
 }
 
 pub struct Subsystem<T = ()> {
@@ -1097,19 +1126,20 @@ impl<T> Subsystem<T> {
             &cancellation_task_name,
         );
 
-        let all_running = self
+        if let Some(all_running) = self
             .subsystems
-            .insert_and_get_all(subsystem_id.clone(), gc_rx);
-
-        let event = MetricsEvent::SubsystemStarted {
-            id: subsystem_id.clone(),
-            all_running: all_running.clone(),
-        };
-        debug!(
-            "Subsystem '{}' started. List of all running subsytems: {:#?}",
-            subsystem_id.name, all_running
-        );
-        trace!(metrics_event = %event);
+            .insert_and_get_all(subsystem_id.clone(), gc_rx)
+        {
+            debug!(
+                "Subsystem '{}' started. List of all running subsytems: {:#?}",
+                subsystem_id.name, all_running
+            );
+            let event = MetricsEvent::SubsystemStarted {
+                id: subsystem_id,
+                all_running,
+            };
+            trace!(metrics_event = %event);
+        }
 
         Some(handle)
     }
@@ -1157,29 +1187,21 @@ impl<T> Subsystem<T> {
 
         match res {
             Ok(Ok(it)) => {
-                let event = MetricsEvent::SubsystemStopped {
-                    id: id.clone(),
-                    outcome: Outcome::TerminatedNormally,
-                    all_running: all_running.clone(),
-                };
-                debug!(
-                    "Subsystem '{}' terminated normally. List of all remaining subsytems: {:#?}",
-                    id.name, all_running
+                log_subsystem_stopped(
+                    &id,
+                    || Outcome::TerminatedNormally,
+                    all_running,
+                    "terminated normally",
                 );
-                trace!(metrics_event = %event);
                 let _ = res_tx.send(Some(Ok(it)));
             }
             Ok(Err(e)) => {
-                let event = MetricsEvent::SubsystemStopped {
-                    id: id.clone(),
-                    outcome: Outcome::TerminatedWithError(e.to_string()),
-                    all_running: all_running.clone(),
-                };
-                debug!(
-                    "Subsystem '{}' terminated with error: {e}. List of all remaining subsytems: {:#?}",
-                    id.name, all_running
+                log_subsystem_stopped(
+                    &id,
+                    || Outcome::TerminatedWithError(e.to_string()),
+                    all_running,
+                    format_args!("terminated with error: {e}"),
                 );
-                trace!(metrics_event = %event);
                 let err = RootSystemError::Error(id, e);
                 crash.set_crash(err.clone());
                 let _ = res_tx.send(Some(Err(err)));
@@ -1187,31 +1209,23 @@ impl<T> Subsystem<T> {
             Err(e) => {
                 if e.is_panic() {
                     error!("Subsystem '{}' panicked: {}", id.name, e);
-                    let event = MetricsEvent::SubsystemStopped {
-                        id: id.clone(),
-                        outcome: Outcome::TerminatedWithError(e.to_string()),
-                        all_running: all_running.clone(),
-                    };
-                    trace!(
-                        "Subsystem '{}' panicked: {e}. List of all remaining subsytems: {:#?}",
-                        id.name, all_running
+                    log_subsystem_stopped(
+                        &id,
+                        || Outcome::TerminatedWithError(e.to_string()),
+                        all_running,
+                        format_args!("panicked: {e}"),
                     );
-                    trace!(metrics_event = %event);
                     let err = RootSystemError::Panic(id, miette::Report::from_err(e).into());
                     crash.set_crash(err.clone());
                     let _ = res_tx.send(Some(Err(err)));
                 } else {
                     warn!("Subsystem '{}' was shut down forcefully.", id.name);
-                    let event = MetricsEvent::SubsystemStopped {
-                        id: id.clone(),
-                        outcome: Outcome::ShutdownForced,
-                        all_running: all_running.clone(),
-                    };
-                    debug!(
-                        "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}",
-                        id.name, all_running
+                    log_subsystem_stopped(
+                        &id,
+                        || Outcome::ShutdownForced,
+                        all_running,
+                        "was shut down forcefully",
                     );
-                    trace!(metrics_event = %event);
                     let err = RootSystemError::ForcedShutdown;
                     crash.set_crash(err.clone());
                     let _ = res_tx.send(Some(Err(err)));
@@ -1237,16 +1251,12 @@ impl<T> Subsystem<T> {
 
         warn!("Subsystem '{}' was shut down forcefully.", id);
 
-        let event = MetricsEvent::SubsystemStopped {
-            id: id.clone(),
-            outcome: Outcome::ShutdownForced,
-            all_running: all_running.clone(),
-        };
-        debug!(
-            "Subsystem '{}' was shut down forcefully. List of all remaining subsytems: {:#?}",
-            id.name, all_running
+        log_subsystem_stopped(
+            &id,
+            || Outcome::ShutdownForced,
+            all_running,
+            "was shut down forcefully",
         );
-        trace!(metrics_event = %event);
 
         let _ = res_tx.send(Some(Err(RootSystemError::ForcedShutdown)));
     }
